@@ -53,7 +53,8 @@ class BinStatus(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     """Create default bins on startup if they don't exist"""
-    db = next(get_db())
+    from database import SessionLocal
+    db = SessionLocal()
     try:
         organic_bin = db.query(Bin).filter(Bin.id == "0x001").first()
         if not organic_bin:
