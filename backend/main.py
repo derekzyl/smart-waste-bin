@@ -1,19 +1,22 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
+from sqlalchemy.orm import Session
 import uvicorn
 import cv2
 import numpy as np
-from PIL import Image
-import io
-import base64
 from datetime import datetime
-import json
 import os
+from image_classifier import MaterialClassifier
+from database import get_db, engine, Base
+from models import Bin, DetectionLog, BinEvent
 
-app = FastAPI(title="Smart Waste Bin Backend API")
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Smart Waste Bin Backend API", version="2.0.0")
 
 # CORS middleware
 app.add_middleware(
@@ -24,74 +27,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory storage (replace with database in production)
-bins_db = {
-    "0x001": {
-        "id": "0x001",
-        "type": "organic",
-        "weight": 0.0,
-        "level": 0,
-        "full": False,
-        "last_update": None
-    },
-    "0x002": {
-        "id": "0x002",
-        "type": "non_organic",
-        "weight": 0.0,
-        "level": 0,
-        "full": False,
-        "last_update": None
-    }
-}
-
-# Simple material classification model (mock - replace with actual ML model)
-class MaterialClassifier:
-    def __init__(self):
-        # In production, load a trained model here
-        # For now, using simple color-based detection
-        pass
-    
-    def classify(self, image: np.ndarray) -> dict:
-        """
-        Classify material type from image.
-        Returns: {"material": "ORGANIC" or "NON_ORGANIC", "confidence": float}
-        """
-        # Convert to HSV for better color analysis
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        
-        # Simple heuristic: analyze dominant colors
-        # Green/brown tones -> organic
-        # Blue/white/metallic tones -> non-organic
-        
-        # Calculate average hue
-        avg_hue = np.mean(hsv[:, :, 0])
-        avg_sat = np.mean(hsv[:, :, 1])
-        avg_val = np.mean(hsv[:, :, 2])
-        
-        # Simple classification logic
-        # Organic: green/brown (hue 30-90), higher saturation
-        # Non-organic: blue/white (hue 90-150 or low saturation)
-        
-        if 30 <= avg_hue <= 90 and avg_sat > 80:
-            material = "ORGANIC"
-            confidence = 0.75
-        elif avg_hue < 30 or avg_hue > 150 or avg_sat < 50:
-            material = "NON_ORGANIC"
-            confidence = 0.70
-        else:
-            # Default classification
-            material = "ORGANIC"
-            confidence = 0.60
-        
-        return {
-            "material": material,
-            "confidence": confidence,
-            "hue": float(avg_hue),
-            "saturation": float(avg_sat),
-            "brightness": float(avg_val)
-        }
-
-classifier = MaterialClassifier()
+# Initialize material classifier
+model_path = os.getenv("MODEL_PATH", "models/material_classifier.pkl")
+classifier = MaterialClassifier(model_path=model_path)
 
 # Request/Response Models
 class BinUpdate(BaseModel):
@@ -111,23 +49,50 @@ class BinStatus(BaseModel):
     full: bool
     last_update: Optional[str] = None
 
+# Initialize default bins if they don't exist
+@app.on_event("startup")
+async def startup_event():
+    """Create default bins on startup if they don't exist"""
+    db = next(get_db())
+    try:
+        organic_bin = db.query(Bin).filter(Bin.id == "0x001").first()
+        if not organic_bin:
+            organic_bin = Bin(id="0x001", type="organic")
+            db.add(organic_bin)
+        
+        non_organic_bin = db.query(Bin).filter(Bin.id == "0x002").first()
+        if not non_organic_bin:
+            non_organic_bin = Bin(id="0x002", type="non_organic")
+            db.add(non_organic_bin)
+        
+        db.commit()
+        print("Default bins initialized")
+    except Exception as e:
+        print(f"Error initializing bins: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
 # ==================== API ENDPOINTS ====================
 
 @app.get("/")
 async def root():
     return {
         "message": "Smart Waste Bin Backend API",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "database": "PostgreSQL",
         "endpoints": {
             "detect": "/api/detect (POST)",
             "bins": "/api/bins (GET)",
             "bin_status": "/api/bins/{bin_id} (GET)",
-            "update_bins": "/api/bins/update (POST)"
+            "update_bins": "/api/bins/update (POST)",
+            "events": "/api/events (GET)",
+            "detections": "/api/detections (GET)"
         }
     }
 
 @app.post("/api/detect")
-async def detect_material(file: UploadFile = File(...)):
+async def detect_material(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
     Detect material type from image.
     Accepts JPEG image and returns classification result.
@@ -143,11 +108,22 @@ async def detect_material(file: UploadFile = File(...)):
         if image is None:
             raise HTTPException(status_code=400, detail="Invalid image format")
         
-        # Classify material
+        # Classify material using advanced image recognition
         result = classifier.classify(image)
         
+        # Log detection to database
+        detection_log = DetectionLog(
+            material=result['material'],
+            confidence=result['confidence'],
+            method=result.get('method', 'unknown')
+        )
+        db.add(detection_log)
+        db.commit()
+        
         # Log detection
-        print(f"[{datetime.now()}] Material detected: {result['material']} (confidence: {result['confidence']:.2f})")
+        method = result.get('method', 'unknown')
+        print(f"[{datetime.now()}] Material detected: {result['material']} "
+              f"(confidence: {result['confidence']:.2f}, method: {method})")
         
         return JSONResponse(content=result)
     
@@ -155,24 +131,58 @@ async def detect_material(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Detection error: {str(e)}")
 
 @app.post("/api/bins/update")
-async def update_bins(data: BinUpdate):
+async def update_bins(data: BinUpdate, db: Session = Depends(get_db)):
     """
     Update bin status from ESP32.
     """
     try:
         # Update organic bin
-        if data.bin_organic_id in bins_db:
-            bins_db[data.bin_organic_id]["weight"] = data.organic_weight
-            bins_db[data.bin_organic_id]["level"] = int((data.organic_weight / 10.0) * 100)
-            bins_db[data.bin_organic_id]["full"] = data.organic_full
-            bins_db[data.bin_organic_id]["last_update"] = datetime.now().isoformat()
+        organic_bin = db.query(Bin).filter(Bin.id == data.bin_organic_id).first()
+        if organic_bin:
+            organic_bin.weight = data.organic_weight
+            organic_bin.level = int((data.organic_weight / 10.0) * 100)
+            organic_bin.full = data.organic_full
+            organic_bin.last_update = datetime.now()
+            
+            # Log event if bin became full
+            if data.organic_full and not organic_bin.full:
+                event = BinEvent(bin_id=data.bin_organic_id, event_type="full")
+                db.add(event)
+        else:
+            # Create new bin if it doesn't exist
+            organic_bin = Bin(
+                id=data.bin_organic_id,
+                type="organic",
+                weight=data.organic_weight,
+                level=int((data.organic_weight / 10.0) * 100),
+                full=data.organic_full
+            )
+            db.add(organic_bin)
         
         # Update non-organic bin
-        if data.bin_non_organic_id in bins_db:
-            bins_db[data.bin_non_organic_id]["weight"] = data.non_organic_weight
-            bins_db[data.bin_non_organic_id]["level"] = int((data.non_organic_weight / 10.0) * 100)
-            bins_db[data.bin_non_organic_id]["full"] = data.non_organic_full
-            bins_db[data.bin_non_organic_id]["last_update"] = datetime.now().isoformat()
+        non_organic_bin = db.query(Bin).filter(Bin.id == data.bin_non_organic_id).first()
+        if non_organic_bin:
+            non_organic_bin.weight = data.non_organic_weight
+            non_organic_bin.level = int((data.non_organic_weight / 10.0) * 100)
+            non_organic_bin.full = data.non_organic_full
+            non_organic_bin.last_update = datetime.now()
+            
+            # Log event if bin became full
+            if data.non_organic_full and not non_organic_bin.full:
+                event = BinEvent(bin_id=data.bin_non_organic_id, event_type="full")
+                db.add(event)
+        else:
+            # Create new bin if it doesn't exist
+            non_organic_bin = Bin(
+                id=data.bin_non_organic_id,
+                type="non_organic",
+                weight=data.non_organic_weight,
+                level=int((data.non_organic_weight / 10.0) * 100),
+                full=data.non_organic_full
+            )
+            db.add(non_organic_bin)
+        
+        db.commit()
         
         return {
             "status": "success",
@@ -180,63 +190,112 @@ async def update_bins(data: BinUpdate):
         }
     
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Update error: {str(e)}")
 
 @app.get("/api/bins")
-async def get_all_bins():
+async def get_all_bins(db: Session = Depends(get_db)):
     """
     Get status of all bins.
     """
+    bins = db.query(Bin).all()
     return {
-        "bins": list(bins_db.values()),
+        "bins": [bin.to_dict() for bin in bins],
         "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/api/bins/{bin_id}")
-async def get_bin_status(bin_id: str):
+async def get_bin_status(bin_id: str, db: Session = Depends(get_db)):
     """
     Get status of a specific bin.
     """
-    if bin_id not in bins_db:
+    bin = db.query(Bin).filter(Bin.id == bin_id).first()
+    if not bin:
         raise HTTPException(status_code=404, detail="Bin not found")
     
-    return bins_db[bin_id]
+    return bin.to_dict()
 
 @app.get("/api/stats")
-async def get_statistics():
+async def get_statistics(db: Session = Depends(get_db)):
     """
     Get overall statistics.
     """
-    total_weight = sum(bin["weight"] for bin in bins_db.values())
-    full_bins = sum(1 for bin in bins_db.values() if bin["full"])
-    avg_level = sum(bin["level"] for bin in bins_db.values()) / len(bins_db)
+    bins = db.query(Bin).all()
+    total_weight = sum(bin.weight for bin in bins)
+    full_bins = sum(1 for bin in bins if bin.full)
+    avg_level = sum(bin.level for bin in bins) / len(bins) if bins else 0
+    
+    # Get recent detections count
+    recent_detections = db.query(DetectionLog).count()
     
     return {
-        "total_bins": len(bins_db),
+        "total_bins": len(bins),
         "full_bins": full_bins,
         "total_weight": total_weight,
         "average_level": round(avg_level, 2),
+        "total_detections": recent_detections,
         "timestamp": datetime.now().isoformat()
     }
 
 @app.post("/api/bins/{bin_id}/reset")
-async def reset_bin(bin_id: str):
+async def reset_bin(bin_id: str, db: Session = Depends(get_db)):
     """
     Reset bin (for maintenance).
     """
-    if bin_id not in bins_db:
+    bin = db.query(Bin).filter(Bin.id == bin_id).first()
+    if not bin:
         raise HTTPException(status_code=404, detail="Bin not found")
     
-    bins_db[bin_id]["weight"] = 0.0
-    bins_db[bin_id]["level"] = 0
-    bins_db[bin_id]["full"] = False
-    bins_db[bin_id]["last_update"] = datetime.now().isoformat()
+    bin.weight = 0.0
+    bin.level = 0
+    bin.full = False
+    bin.last_update = datetime.now()
+    
+    # Log reset event
+    event = BinEvent(bin_id=bin_id, event_type="reset")
+    db.add(event)
+    db.commit()
     
     return {
         "status": "success",
         "message": f"Bin {bin_id} reset successfully"
     }
 
+@app.get("/api/events")
+async def get_events(limit: int = 50, db: Session = Depends(get_db)):
+    """
+    Get recent bin events.
+    """
+    events = db.query(BinEvent).order_by(BinEvent.timestamp.desc()).limit(limit).all()
+    return {
+        "events": [event.to_dict() for event in events],
+        "count": len(events)
+    }
+
+@app.get("/api/detections")
+async def get_detections(limit: int = 50, db: Session = Depends(get_db)):
+    """
+    Get recent material detections.
+    """
+    detections = db.query(DetectionLog).order_by(DetectionLog.timestamp.desc()).limit(limit).all()
+    return {
+        "detections": [detection.to_dict() for detection in detections],
+        "count": len(detections)
+    }
+
+@app.post("/api/bins/{bin_id}/event")
+async def log_bin_event(bin_id: str, event_type: str, db: Session = Depends(get_db)):
+    """
+    Log a bin event (open, close, etc.).
+    """
+    event = BinEvent(bin_id=bin_id, event_type=event_type)
+    db.add(event)
+    db.commit()
+    
+    return {
+        "status": "success",
+        "event": event.to_dict()
+    }
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
