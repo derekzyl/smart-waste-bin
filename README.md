@@ -197,7 +197,7 @@ smart-waste-bin/
 
 ## 🔐 Security & Configuration
 
-- WiFi credentials stored in firmware (consider using WiFiManager for production)
+- WiFi credentials stored in firmware 
 - Backend API endpoints can be secured with authentication
 - Bin IDs are unique identifiers for tracking
 
