@@ -208,13 +208,6 @@ smart-waste-bin/
 3. **Network Testing**: Verify WiFi connectivity and backend communication
 4. **App Testing**: Test all app features on both WiFi and direct ESP32 connection
 
-## 📝 Notes
-
-- The material detection uses a simple color-based classifier. For production, train a proper ML model (TensorFlow Lite, PyTorch Mobile).
-- CAN communication uses ESP32's TWAI (Two-Wire Automotive Interface).
-- Current storage is in-memory. For production, use a database (PostgreSQL, MongoDB).
-- Servo angles may need calibration based on your bin lid mechanism.
-
 ## 🤝 Contributing
 
 1. Fork the repository
