@@ -15,11 +15,11 @@ Provides power input and programming interface for ESP32 development and firmwar
 
 ## Sensors
 
-### HC-SR04 Ultrasonic Sensor
-Measures distance to waste level using sound waves to determine bin fill percentage.
+### HC-SR04 Ultrasonic Sensor (Presence Detection)
+Replaces the PIR sensor to detect when a person is approaching the bin to trigger the system.
 
-### JSN-SR04T Waterproof Ultrasonic Sensor (Alternative)
-Waterproof version of HC-SR04 for outdoor installations that require protection from moisture.
+### JSN-SR04T Waterproof Ultrasonic Sensor (x2)
+Two waterproof sensors used to measure the fill levels of the Organic and Non-Organic bins independently.
 
 ### Load Cell (5kg or 10kg)
 Measures the weight of waste in the bin using strain gauge technology.
@@ -27,19 +27,16 @@ Measures the weight of waste in the bin using strain gauge technology.
 ### HX711 Load Cell Amplifier Module
 Amplifies and converts analog load cell signals into digital data readable by the ESP32.
 
-### PIR Motion Sensor (HC-SR501)
-Detects human presence near the bin using passive infrared radiation to trigger automatic opening.
-
 ---
 
 ## Actuators & Feedback
 
-
 ### MG996R Servo Motor (Alternative)
 Heavy-duty servo motor capable of handling bin lids up to 1.5kg with higher torque.
 
-### 5mm LED (Red/Green/Blue)
-Visual indicators that display bin status, fill level, and system state through color coding.
+### 5mm LED (2x Red, 2x Green)
+- **2x Red**: Indicate when the Organic or Non-Organic bin is full.
+- **2x Green**: Indicate that the Organic or Non-Organic bin has space available.
 
 ### Piezo Buzzer (Active 3-5V)
 Provides audio feedback for bin operations, alerts, and warnings.

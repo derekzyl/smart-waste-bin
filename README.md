@@ -167,13 +167,16 @@ smart-waste-bin/
 ## 🔌 Pin Configuration
 
 ### ESP32 Main Controller
-- **PIR**: GPIO 2
-- **Ultrasonic**: TRIG=GPIO 4, ECHO=GPIO 5
+### ESP32 Main Controller
+- **Presence Ultrasonic**: TRIG=GPIO 4, ECHO=GPIO 5
+- **Organic Level Ultrasonic**: TRIG=GPIO 25, ECHO=GPIO 26
+- **Inorganic Level Ultrasonic**: TRIG=GPIO 32, ECHO=GPIO 33
 - **Servos**: Organic=GPIO 18, Non-Organic=GPIO 19
 - **Load Cell**: DOUT=GPIO 16, SCK=GPIO 17
-- **LEDs**: Red=GPIO 25, Green=GPIO 26, Blue=GPIO 27
-- **Buzzer**: GPIO 14
-- **Keypad**: Button1=GPIO 12, Button2=GPIO 13
+- **LEDs Organic**: Red=GPIO 27, Green=GPIO 14
+- **LEDs Inorganic**: Red=GPIO 12, Green=GPIO 13
+- **Buzzer**: GPIO 15
+- **Keypad**: Button1=GPIO 23, Button2=GPIO 2 (reassigned due to PIR removal)
 - **CAN**: TX=GPIO 21, RX=GPIO 22
 
 ## 🎮 Usage
