@@ -34,8 +34,6 @@ Detects human presence near the bin using passive infrared radiation to trigger 
 
 ## Actuators & Feedback
 
-### SG90 Micro Servo Motor
-Lightweight servo motor for opening/closing bin lids weighing less than 500g.
 
 ### MG996R Servo Motor (Alternative)
 Heavy-duty servo motor capable of handling bin lids up to 1.5kg with higher torque.
@@ -56,8 +54,7 @@ Manual override buttons for opening bins when automatic system is unavailable or
 ### 18650 Li-ion Cell (3000-3500mAh)
 Rechargeable battery cells providing 3.7V power source for portable operation.
 
-### TP4056 Charging Module with Protection
-Charges 18650 batteries safely with overcharge, over-discharge, and short-circuit protection.
+
 
 ### MT3608 Boost Converter (2A, Adjustable)
 Steps up battery voltage to 5V for powering servos and other 5V components.
@@ -126,19 +123,6 @@ Flexible power and ground wires with high-temperature resistance for permanent i
 
 ### Heat Shrink Tubing (Assorted Sizes)
 Protective insulation that shrinks when heated to secure and insulate wire connections.
-
----
-
-## PCB & Mounting
-
-### Perforated PCB Board (5×7cm or 7×9cm)
-Prototyping board for permanent component mounting and circuit assembly.
-
-### M3 Standoffs and Screws
-Hardware for mounting PCBs and creating secure mechanical connections in the enclosure.
-
-### Hot Glue Gun or Double-Sided Foam Tape
-Adhesive mounting options for securing sensors and components without drilling.
 
 ---
 

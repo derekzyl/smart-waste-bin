@@ -45,7 +45,6 @@ A comprehensive IoT-based smart waste bin system that automatically detects mate
 - **ESP32-WROOM-32** (Main Controller)
 - **ESP32-CAM** (Material Detection)
 - **HC-SR04 Ultrasonic Sensor** (Distance/Bin Level)
-- **PIR Motion Sensor** (HC-SR501)
 - **Load Cell 5-10kg + HX711** (Weight Measurement)
 - **SG90/MG996R Servo Motors** (Lid Control)
 - **LEDs** (Red/Green/Blue for Status)
