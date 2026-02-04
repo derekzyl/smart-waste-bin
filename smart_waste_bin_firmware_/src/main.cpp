@@ -9,31 +9,32 @@
 
 // ==================== PIN DEFINITIONS ====================
 // Ultrasonic Sensors
-#define TRIG_PIN_PRESENCE 4
-#define ECHO_PIN_PRESENCE 5
+#define TRIG_PIN_PRESENCE 5
+#define ECHO_PIN_PRESENCE 17
 
-#define TRIG_PIN_ORG 25
-#define ECHO_PIN_ORG 26
+#define TRIG_PIN_ORG 22
+#define ECHO_PIN_ORG 23
 
-#define TRIG_PIN_INORG 32
-#define ECHO_PIN_INORG 33
+#define TRIG_PIN_INORG 16
+#define ECHO_PIN_INORG 4
 
 // Servo Motors (for bin lids)
 #define SERVO_ORGANIC_PIN 18
 #define SERVO_NON_ORGANIC_PIN 19
 
-// Load Cell
-#define LOAD_CELL_DOUT_PIN 16
-#define LOAD_CELL_SCK_PIN 17
+#define CAM_TRIGGER_PIN 21
+
+
+
 
 // LEDs
 // Organic Bin LEDs
-#define LED_ORG_RED_PIN 27   // Full
-#define LED_ORG_GREEN_PIN 14 // Available
+#define LED_ORG_RED_PIN 33   // Full
+#define LED_ORG_GREEN_PIN 26 // Available
 
 // Inorganic Bin LEDs
-#define LED_INORG_RED_PIN 12   // Full
-#define LED_INORG_GREEN_PIN 13 // Available
+#define LED_INORG_RED_PIN 25   // Full
+#define LED_INORG_GREEN_PIN 32 // Available
 
 // Buzzer
 #define BUZZER_PIN 15
