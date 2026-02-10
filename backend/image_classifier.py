@@ -6,14 +6,16 @@ Uses computer vision and machine learning for accurate waste material detection
 import os
 from typing import Dict, Optional
 
-import cv2
-import google.generativeai as genai
 import joblib
 import numpy as np
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from PIL import Image
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
+
+# Move heavy imports to lazy loading or global but checked
+# from sklearn.ensemble import RandomForestClassifier
+# from sklearn.preprocessing import StandardScaler
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +28,9 @@ class MaterialClassifier:
     """
 
     def __init__(self, model_path: Optional[str] = None):
+        # Lazy import sklearn
+        from sklearn.preprocessing import StandardScaler
+
         self.model_path = model_path
         self.model = None
         self.scaler = StandardScaler()
@@ -41,11 +46,10 @@ class MaterialClassifier:
         # Initialize Gemini
         self.api_key = os.getenv("GEMINI_API_KEY")
         if self.api_key:
-            genai.configure(api_key=self.api_key)
-            self.gemini_model = genai.GenerativeModel("gemini-flash-latest")
+            self.client = genai.Client(api_key=self.api_key)
         else:
             print("Warning: GEMINI_API_KEY not found. Gemini classification disabled.")
-            self.gemini_model = None
+            self.client = None
 
     def _initialize_default_classifier(self):
         """Initialize with a rule-based classifier as fallback"""
@@ -57,6 +61,8 @@ class MaterialClassifier:
         Extract comprehensive features from image for classification.
         Returns a feature vector combining multiple image characteristics.
         """
+        import cv2  # Lazy import
+
         features = []
 
         # Resize image for consistent processing
@@ -201,28 +207,29 @@ class MaterialClassifier:
         features = features.reshape(1, -1)
 
         # Try Gemini Classification first
-        if self.gemini_model:
+        if self.client:
             try:
+                import cv2  # Lazy import
+
                 # Convert CV2 BGR to PIL RGB
                 img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(img_rgb)
 
-                response = self.gemini_model.generate_content([
-                    "Classify this waste material image into exactly one of these two categories: 'ORGANIC' or 'NON_ORGANIC'. "
-                    'Return ONLY a JSON object with this format: {"material": "CATEGORY", "confidence": 0.95}',
-                    pil_image,
-                ])
+                response = self.client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=[
+                        "Classify this waste material image into exactly one of these two categories: 'ORGANIC' or 'NON_ORGANIC'. "
+                        'Return ONLY a JSON object with this format: {"material": "CATEGORY", "confidence": 0.95}',
+                        pil_image,
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    ),
+                )
 
-                # Parse response
                 import json
 
                 text_response = response.text.strip()
-                # Handle potential markdown code blocks in response
-                if text_response.startswith("```json"):
-                    text_response = text_response[7:-3]
-                elif text_response.startswith("```"):
-                    text_response = text_response[3:-3]
-
                 result = json.loads(text_response)
 
                 return {
@@ -347,6 +354,8 @@ class MaterialClassifier:
 
         # Train Random Forest classifier
         print("Training model...")
+        from sklearn.ensemble import RandomForestClassifier  # Lazy import
+
         self.model = RandomForestClassifier(
             n_estimators=100, max_depth=20, random_state=42, n_jobs=-1
         )

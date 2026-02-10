@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
 import '../providers/bin_provider.dart';
+import '../utils/constants.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -25,29 +27,75 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _backendUrlController.text =
-          prefs.getString('backend_url') ?? 'http://192.168.1.100:8000';
-      _esp32IpController.text =
-          prefs.getString('esp32_ip') ?? '';
+          prefs.getString('backend_url') ?? AppConstants.defaultBackendUrl;
+      _esp32IpController.text = prefs.getString('esp32_ip') ?? '';
     });
   }
 
   Future<void> _saveSettings() async {
     setState(() => _isLoading = true);
-    
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('backend_url', _backendUrlController.text);
     await prefs.setString('esp32_ip', _esp32IpController.text);
-    
+
     // Update provider
     context.read<BinProvider>().setEsp32Ip(
-          _esp32IpController.text.isEmpty ? null : _esp32IpController.text,
-        );
-    
+      _esp32IpController.text.isEmpty ? null : _esp32IpController.text,
+    );
+
     setState(() => _isLoading = false);
-    
+
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Settings saved successfully')),
+      );
+    }
+  }
+
+  Future<void> _testMotor(String type) async {
+    setState(() => _isLoading = true);
+
+    if (!mounted) return;
+
+    // 1. Open
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Opening $type bin...')));
+
+    final openSuccess = await context.read<BinProvider>().openBin(type);
+
+    if (!openSuccess) {
+      if (mounted) {
+        setState(() => _isLoading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Failed to open bin. Check connection.'),
+          ),
+        );
+      }
+      return;
+    }
+
+    // 2. Wait
+    await Future.delayed(const Duration(seconds: 2));
+
+    // 3. Close
+    if (mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Closing $type bin...')));
+
+      final closeSuccess = await context.read<BinProvider>().closeBin(type);
+
+      setState(() => _isLoading = false);
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            closeSuccess ? 'Motor test complete!' : 'Failed to close bin.',
+          ),
+        ),
       );
     }
   }
@@ -106,6 +154,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                           keyboardType: TextInputType.number,
                         ),
+                        const SizedBox(height: 8),
+                        TextButton.icon(
+                          onPressed: () {
+                            setState(() {
+                              _esp32IpController.text = '192.168.4.1';
+                            });
+                          },
+                          icon: const Icon(Icons.wifi_tethering),
+                          label: const Text(
+                            'Connect to Local AP (192.168.4.1)',
+                          ),
+                          style: TextButton.styleFrom(
+                            foregroundColor: Colors.blue.shade700,
+                            padding: EdgeInsets.zero,
+                            alignment: Alignment.centerLeft,
+                          ),
+                        ),
+                        const Padding(
+                          padding: EdgeInsets.only(bottom: 16),
+                          child: Text(
+                            'Note: Join "SmartBin_AP" WiFi if internet is down.',
+                            style: TextStyle(fontSize: 12, color: Colors.grey),
+                          ),
+                        ),
                         const SizedBox(height: 16),
                         SizedBox(
                           width: double.infinity,
@@ -117,6 +189,47 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               padding: const EdgeInsets.symmetric(vertical: 16),
                             ),
                             child: const Text('Save Settings'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Diagnostics',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        ListTile(
+                          leading: const Icon(
+                            Icons.build,
+                            color: Colors.orange,
+                          ),
+                          title: const Text('Test Organic Motor'),
+                          subtitle: const Text('Cycle Open/Close'),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.play_circle_fill),
+                            onPressed: () => _testMotor('organic'),
+                          ),
+                        ),
+                        const Divider(),
+                        ListTile(
+                          leading: const Icon(Icons.build, color: Colors.blue),
+                          title: const Text('Test One-Organic Motor'),
+                          subtitle: const Text('Cycle Open/Close'),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.play_circle_fill),
+                            onPressed: () => _testMotor('non_organic'),
                           ),
                         ),
                       ],
@@ -157,4 +270,3 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 }
-

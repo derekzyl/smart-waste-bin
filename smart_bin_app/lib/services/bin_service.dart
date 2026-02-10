@@ -1,7 +1,10 @@
 import 'dart:convert';
+
 import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
+
 import '../models/bin_model.dart';
+import '../utils/constants.dart';
 
 class BinService {
   final String baseUrl;
@@ -9,8 +12,8 @@ class BinService {
   WebSocketChannel? _channel;
 
   BinService({
-    this.baseUrl = 'http://192.168.1.100:8000',
-    this.wsUrl = 'ws://192.168.1.100:81',
+    this.baseUrl = AppConstants.defaultBackendUrl,
+    this.wsUrl = 'ws://${AppConstants.defaultLocalIp}:81',
   });
 
   // HTTP API Methods
@@ -54,15 +57,27 @@ class BinService {
 
   Future<bool> openBin(String binType, {String? esp32Ip}) async {
     try {
-      final url = esp32Ip != null
-          ? 'http://$esp32Ip/api/open'
-          : '$baseUrl/api/open';
-      final response = await http.post(
-        Uri.parse(url),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode({'bin': binType}),
-      );
-      return response.statusCode == 200;
+      if (esp32Ip != null) {
+        // Local Direct Control
+        final url = 'http://$esp32Ip/api/open';
+        final response = await http.post(
+          Uri.parse(url),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'bin': binType}),
+        );
+        return response.statusCode == 200;
+      } else {
+        // Remote Command Queue
+        // Map type to ID (Hardcoded to match Firmware)
+        final binId = binType == 'organic' ? '0x001' : '0x002';
+        final url = '$baseUrl/api/bins/$binId/command';
+        final response = await http.post(
+          Uri.parse(url),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'command': 'OPEN', 'params': {}}),
+        );
+        return response.statusCode == 200;
+      }
     } catch (e) {
       return false;
     }
@@ -70,15 +85,26 @@ class BinService {
 
   Future<bool> closeBin(String binType, {String? esp32Ip}) async {
     try {
-      final url = esp32Ip != null
-          ? 'http://$esp32Ip/api/close'
-          : '$baseUrl/api/close';
-      final response = await http.post(
-        Uri.parse(url),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode({'bin': binType}),
-      );
-      return response.statusCode == 200;
+      if (esp32Ip != null) {
+        // Local Direct Control
+        final url = 'http://$esp32Ip/api/close';
+        final response = await http.post(
+          Uri.parse(url),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'bin': binType}),
+        );
+        return response.statusCode == 200;
+      } else {
+        // Remote Command Queue
+        final binId = binType == 'organic' ? '0x001' : '0x002';
+        final url = '$baseUrl/api/bins/$binId/command';
+        final response = await http.post(
+          Uri.parse(url),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'command': 'CLOSE', 'params': {}}),
+        );
+        return response.statusCode == 200;
+      }
     } catch (e) {
       return false;
     }
@@ -130,4 +156,3 @@ class BinService {
     return _channel?.stream;
   }
 }
-
