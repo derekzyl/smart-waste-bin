@@ -1,28 +1,34 @@
 /**
- * ESP32-CAM Material Detection System
+ * ESP32-CAM Material Detection - COMPLETE WIRELESS VERSION
  * 
- * SAFE GPIO PINS USED (Assumes SD Card is UNUSED):
- * - GPIO 14: UART TX to ESP32 Main (Use SD CLK/CMD if available)
- * - GPIO 16: Trigger input from ESP32 Main (User identified as safe)
+ * Features:
+ * - ESP-NOW wireless communication with ESP32 Main
+ * - GPIO trigger input (backup/redundant)
+ * - UART TX output (backup)
+ * - WiFi backend integration
+ * - Boot-safe pin configuration
  * 
- * AVOIDED PINS:
- * - GPIO 0: Boot mode selection (must be HIGH during boot)
- * - GPIO 1/3: Used for programming/debugging
- * - GPIO 33: Internal LED / Not exposed
+ * Pin Configuration:
+ * - UART TX: GPIO 14 (SD CLK - safe if SD unused)
+ * - Trigger: GPIO 13 (SD D3 - boot-safe)
  * 
- * Communication: UART (GPIO 14 TX) + GPIO Trigger (GPIO 16)
- * Responds: Instantly via UART with material detection result
+ * Communication Priority:
+ * 1. ESP-NOW (wireless) - Primary
+ * 2. GPIO Trigger - Backup
+ * 3. UART TX - Backup response
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_now.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include "esp_camera.h"
 #include <WebSocketsServer.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
-// ==================== CAMERA PINS (ESP32-CAM - Pre-defined) ====================
+// ==================== CAMERA PINS ====================
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -40,66 +46,110 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// ==================== SAFE GPIO PINS FOR COMMUNICATION ====================
-// Based on https://lastminuteengineers.com/esp32-cam-pinout-reference/
-
-// UART TX - GPIO 14 - SAFE TO USE (if SD card unused)
-// GPIO 16 is requested for Trigger, so we use GPIO 14 for UART TX
+// ==================== COMMUNICATION PINS ====================
+// UART TX - GPIO 14 (SD CLK - safe if SD unused)
 #define UART_TX_PIN       14
 
-// Trigger Input - GPIO 16 - User requested "safest" pin
-// Note: GPIO 16 is often PSRAM CS. If camera instability occurs, disable PSRAM.
-#define TRIGGER_PIN       16
+// Trigger Input - GPIO 13 (SD D3 - boot-safe)
+#define TRIGGER_PIN       13
 
 #define UART_BAUD         115200
 
-// ==================== GLOBAL VARIABLES ====================
-const char* ssid = "*";
-const char* password = "........a";
-const char* backend_url = "https://xenophobic-netta-cybergenii-1584fde7.koyeb.app";
+// Built-in flash LED
+#define FLASH_LED_PIN     4
 
-// Local access password
+// ==================== GLOBAL VARIABLES ====================
+const char* ssid = "cybergenii";
+const char* password = "12341234";
+const char* backend_url = "https://xenophobic-netta-cybergenii-1584fde7.koyeb.app";
 const char* local_access_password = "SmartBin2025";
 
 WebSocketsServer webSocket(81);
 AsyncWebServer server(80);
 
-// Material detection state
+// ==================== ESP-NOW VARIABLES ====================
+// ESP32 Main MAC Address - WILL BE AUTO-DETECTED
+uint8_t mainControllerMAC[6];
+bool mainControllerRegistered = false;
+bool espNowInitialized = false;
+
+// ESP-NOW Message Structures (must match ESP32 Main)
+typedef struct {
+  char command[32];
+  unsigned long timestamp;
+} CommandMessage;
+
+typedef struct {
+  char material[32];
+  float confidence;
+  unsigned long timestamp;
+} DetectionResult;
+
+// ==================== STATE VARIABLES ====================
 volatile bool detectionRequested = false;
 String lastDetectedMaterial = "UNKNOWN";
 float lastConfidence = 0.0;
+unsigned long lastDetectionTime = 0;
+unsigned long bootTime = 0;
 
-// Built-in LED on GPIO 33 (same as trigger pin, but we use INPUT_PULLUP)
-#define BUILTIN_LED 33
+// Statistics
+int totalDetections = 0;
+int wirelessTriggers = 0;
+int gpioTriggers = 0;
+int wirelessResponses = 0;
+int uartResponses = 0;
 
 // ==================== FUNCTION DECLARATIONS ====================
 void setupCamera();
 void setupWiFi();
+void setupESPNow();
 void setupWebServer();
 void setupUART();
 void IRAM_ATTR triggerISR();
 void detectMaterial();
 void sendToBackend(uint8_t* image, size_t len);
 void sendUARTResult(String material, float confidence);
+void sendESPNowResult(String material, float confidence);
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
 bool authenticateRequest(AsyncWebServerRequest *request);
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len);
+void onDataSent(const uint8_t *mac, esp_now_send_status_t status);
+void flashLED(int times);
 
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
+  bootTime = millis();
+  
   Serial.println("\n\n=================================");
   Serial.println("ESP32-CAM Material Detection");
+  Serial.println("ESP-NOW Wireless + Backup GPIO/UART");
   Serial.println("=================================");
   
-  // Initialize Camera
+  // Initialize flash LED
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
+  
+  // Flash LED on boot
+  flashLED(3);
+  
+  // Initialize Camera FIRST
   setupCamera();
   
   // Initialize WiFi
   setupWiFi();
   
-  // Initialize UART for communication with ESP32 Main
+  // Print MAC address for pairing
+  Serial.print("\n📍 ESP32-CAM MAC Address: ");
+  Serial.println(WiFi.macAddress());
+  Serial.println("   → Add this to ESP32 Main's camMacAddress[]");
+  
+  // Initialize ESP-NOW
+  setupESPNow();
+  
+  // Initialize UART (backup)
   setupUART();
   
   // Initialize Web Server
@@ -109,7 +159,7 @@ void setup() {
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
   
-  // Setup trigger pin with interrupt
+  // Setup trigger pin (GPIO 13 - boot-safe)
   pinMode(TRIGGER_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), triggerISR, RISING);
   
@@ -118,22 +168,39 @@ void setup() {
   Serial.println("=================================");
   Serial.print("Local IP: ");
   Serial.println(WiFi.localIP());
-  Serial.println("\nCommunication Setup:");
-  Serial.println("  UART TX: GPIO 16 (to ESP32 Main RX2)");
-  Serial.println("  Trigger: GPIO 33 (from ESP32 Main)");
-  Serial.println("  Password: " + String(local_access_password));
+  
+  Serial.println("\n📡 Communication Status:");
+  Serial.println("  ESP-NOW: " + String(espNowInitialized ? "✅ Active" : "❌ Failed"));
+  Serial.println("  GPIO Trigger: ✅ Active (GPIO 13)");
+  Serial.println("  UART TX: ✅ Active (GPIO 14)");
+  
+  Serial.println("\n📍 Pin Configuration:");
+  Serial.printf("  UART TX: GPIO%d → ESP32 Main GPIO15\n", UART_TX_PIN);
+  Serial.printf("  Trigger: GPIO%d ← ESP32 Main GPIO4\n", TRIGGER_PIN);
+  
+  Serial.println("\n🎥 Waiting for detection trigger...");
   Serial.println("=================================\n");
+  
+  // Send ready signal
+  delay(500);
+  sendESPNowResult("SYSTEM_READY", 1.0);
+  sendUARTResult("SYSTEM_READY", 1.0);
 }
 
 // ==================== MAIN LOOP ====================
 void loop() {
   webSocket.loop();
   
-  // Check if detection was requested via trigger pin
   if (detectionRequested) {
     detectionRequested = false;
-    Serial.println("\n>>> DETECTION TRIGGERED <<<");
-    detectMaterial();
+    
+    // Debounce
+    if (millis() - lastDetectionTime > 1000) {
+      Serial.println("\n>>> DETECTION TRIGGERED <<<");
+      detectMaterial();
+      lastDetectionTime = millis();
+      totalDetections++;
+    }
   }
   
   delay(10);
@@ -142,6 +209,77 @@ void loop() {
 // ==================== INTERRUPT HANDLER ====================
 void IRAM_ATTR triggerISR() {
   detectionRequested = true;
+  gpioTriggers++;
+}
+
+// ==================== ESP-NOW SETUP ====================
+void setupESPNow() {
+  Serial.println("\nInitializing ESP-NOW...");
+  
+  // Init ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("  ❌ ESP-NOW init failed");
+    espNowInitialized = false;
+    return;
+  }
+  
+  espNowInitialized = true;
+  Serial.println("  ✓ ESP-NOW initialized");
+  
+  // Register callbacks
+  esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataRecv);
+  
+  Serial.println("  ✓ Callbacks registered");
+  Serial.println("  → Waiting for ESP32 Main to pair...");
+}
+
+// ==================== ESP-NOW CALLBACKS ====================
+void onDataSent(const uint8_t *mac, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    Serial.println("📡 ESP-NOW: Send ✅ Success");
+    wirelessResponses++;
+  } else {
+    Serial.println("📡 ESP-NOW: Send ❌ Failed");
+    // Fallback to UART
+    Serial.println("  → Using UART fallback");
+  }
+}
+
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  Serial.println("\n📡 ESP-NOW Command Received");
+  
+  // Auto-register sender as peer if not already registered
+  if (!mainControllerRegistered) {
+    memcpy(mainControllerMAC, mac, 6);
+    
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, mac, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+      mainControllerRegistered = true;
+      Serial.print("  ✅ ESP32 Main registered: ");
+      for (int i = 0; i < 6; i++) {
+        Serial.printf("%02X", mac[i]);
+        if (i < 5) Serial.print(":");
+      }
+      Serial.println();
+    }
+  }
+  
+  CommandMessage cmd;
+  memcpy(&cmd, incomingData, sizeof(cmd));
+  
+  Serial.printf("  Command: %s\n", cmd.command);
+  Serial.printf("  Timestamp: %lu ms\n", cmd.timestamp);
+  
+  if (strcmp(cmd.command, "DETECT") == 0) {
+    detectionRequested = true;
+    wirelessTriggers++;
+    Serial.println("  → Triggering detection...");
+  }
 }
 
 // ==================== CAMERA SETUP ====================
@@ -170,27 +308,56 @@ void setupCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   
-  // Frame size - optimized for AI detection
-  if(psramFound()){
-    config.frame_size = FRAMESIZE_VGA;  // 640x480 - good balance
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_VGA;  // 640x480
     config.jpeg_quality = 10;
     config.fb_count = 2;
-    Serial.println("  PSRAM found - using VGA resolution");
+    Serial.println("  ✓ PSRAM found - using VGA resolution");
   } else {
     config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 12;
     config.fb_count = 1;
-    Serial.println("  No PSRAM - using SVGA resolution");
+    Serial.println("  ⚠️  No PSRAM - using SVGA resolution");
   }
   
-  // Initialize camera
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("  ❌ Camera init failed with error 0x%x\n", err);
-    return;
+    Serial.printf("  ❌ Camera init failed: 0x%x\n", err);
+    Serial.println("  Restarting in 3 seconds...");
+    delay(3000);
+    ESP.restart();
   }
   
   Serial.println("  ✓ Camera initialized successfully");
+  
+  // Sensor settings for better detection
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_brightness(s, 0);     // -2 to 2
+    s->set_contrast(s, 0);       // -2 to 2
+    s->set_saturation(s, 0);     // -2 to 2
+    s->set_special_effect(s, 0); // 0 = No Effect
+    s->set_whitebal(s, 1);       // 0 = disable, 1 = enable
+    s->set_awb_gain(s, 1);       // 0 = disable, 1 = enable
+    s->set_wb_mode(s, 0);        // 0 to 4
+    s->set_exposure_ctrl(s, 1);  // 0 = disable, 1 = enable
+    s->set_aec2(s, 0);           // 0 = disable, 1 = enable
+    s->set_ae_level(s, 0);       // -2 to 2
+    s->set_aec_value(s, 300);    // 0 to 1200
+    s->set_gain_ctrl(s, 1);      // 0 = disable, 1 = enable
+    s->set_agc_gain(s, 0);       // 0 to 30
+    s->set_gainceiling(s, (gainceiling_t)0);  // 0 to 6
+    s->set_bpc(s, 0);            // 0 = disable, 1 = enable
+    s->set_wpc(s, 1);            // 0 = disable, 1 = enable
+    s->set_raw_gma(s, 1);        // 0 = disable, 1 = enable
+    s->set_lenc(s, 1);           // 0 = disable, 1 = enable
+    s->set_hmirror(s, 0);        // 0 = disable, 1 = enable
+    s->set_vflip(s, 0);          // 0 = disable, 1 = enable
+    s->set_dcw(s, 1);            // 0 = disable, 1 = enable
+    s->set_colorbar(s, 0);       // 0 = disable, 1 = enable
+    
+    Serial.println("  ✓ Camera settings optimized");
+  }
 }
 
 // ==================== WIFI SETUP ====================
@@ -210,27 +377,175 @@ void setupWiFi() {
     Serial.println("\n  ✓ WiFi Connected!");
     Serial.print("  IP: ");
     Serial.println(WiFi.localIP());
+    Serial.print("  Signal: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
   } else {
-    Serial.println("\n  ❌ WiFi Connection Failed");
+    Serial.println("\n  ❌ WiFi Failed - Continuing with local communication");
+    Serial.println("  → ESP-NOW and GPIO/UART still work!");
   }
 }
 
 // ==================== UART SETUP ====================
 void setupUART() {
-  // Initialize Serial2 for UART communication with ESP32 Main
-  // TX = GPIO 16 (safe pin according to pinout reference)
-  // We only need TX, no RX needed
-  Serial2.begin(UART_BAUD, SERIAL_8N1, -1, UART_TX_PIN);  // RX=-1 (not used), TX=16
+  Serial2.begin(UART_BAUD, SERIAL_8N1, -1, UART_TX_PIN);
   
-  Serial.println("\nUART Communication Setup:");
-  Serial.println("  ✓ TX on GPIO 16 (to ESP32 Main RX2)");
+  Serial.println("\nUART Backup Communication:");
+  Serial.printf("  ✓ TX on GPIO%d (to ESP32 Main GPIO15)\n", UART_TX_PIN);
   Serial.println("  Baud Rate: 115200");
 }
 
-// ==================== UART COMMUNICATION ====================
+// ==================== LED FLASH ====================
+void flashLED(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(FLASH_LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(FLASH_LED_PIN, LOW);
+    delay(100);
+  }
+}
+
+// ==================== MATERIAL DETECTION ====================
+void detectMaterial() {
+  unsigned long startTime = millis();
+  
+  // Flash LED during capture
+  digitalWrite(FLASH_LED_PIN, HIGH);
+  
+  Serial.println("📸 Capturing image...");
+  camera_fb_t *fb = esp_camera_fb_get();
+  
+  digitalWrite(FLASH_LED_PIN, LOW);
+  
+  if (!fb) {
+    Serial.println("  ❌ Camera capture failed");
+    sendESPNowResult("UNKNOWN", 0.0);
+    sendUARTResult("UNKNOWN", 0.0);
+    return;
+  }
+  
+  Serial.printf("  ✓ Image captured: %d bytes\n", fb->len);
+  Serial.printf("  Resolution: %dx%d\n", fb->width, fb->height);
+  
+  // Send to backend
+  sendToBackend(fb->buf, fb->len);
+  
+  // Return frame buffer
+  esp_camera_fb_return(fb);
+  
+  unsigned long elapsed = millis() - startTime;
+  Serial.printf(">>> Total detection time: %lu ms\n", elapsed);
+  
+  // Print statistics
+  Serial.println("\n📊 Statistics:");
+  Serial.printf("  Total Detections: %d\n", totalDetections);
+  Serial.printf("  Wireless Triggers: %d\n", wirelessTriggers);
+  Serial.printf("  GPIO Triggers: %d\n", gpioTriggers);
+  Serial.printf("  Wireless Responses: %d\n", wirelessResponses);
+  Serial.printf("  UART Responses: %d\n", uartResponses);
+  Serial.printf("  Uptime: %lu seconds\n\n", (millis() - bootTime) / 1000);
+}
+
+// ==================== BACKEND COMMUNICATION ====================
+void sendToBackend(uint8_t *image, size_t len) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("  ⚠️  WiFi not connected - cannot analyze image");
+    Serial.println("  → Sending UNKNOWN result");
+    sendESPNowResult("UNKNOWN", 0.0);
+    sendUARTResult("UNKNOWN", 0.0);
+    return;
+  }
+  
+  Serial.println("🤖 Sending to backend AI...");
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  
+  http.begin(client, String(backend_url) + "/api/detect");
+  http.addHeader("Content-Type", "image/jpeg");
+  http.setTimeout(10000);  // 10 second timeout
+  
+  int httpResponseCode = http.POST(image, len);
+  
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.printf("  ✓ Backend response [%d]\n", httpResponseCode);
+    
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, response);
+    
+    if (!error) {
+      String material = doc["material"].as<String>();
+      float confidence = doc["confidence"].as<float>();
+      
+      Serial.println("  ✅ AI Detection Result:");
+      Serial.printf("    Material: %s\n", material.c_str());
+      Serial.printf("    Confidence: %.2f%%\n", confidence * 100);
+      
+      // Send results via all channels
+      sendESPNowResult(material, confidence);
+      sendUARTResult(material, confidence);
+      
+      lastDetectedMaterial = material;
+      lastConfidence = confidence;
+      
+      // Broadcast to WebSocket clients
+      DynamicJsonDocument wsDoc(256);
+      wsDoc["event"] = "detection_complete";
+      wsDoc["material"] = material;
+      wsDoc["confidence"] = confidence;
+      wsDoc["timestamp"] = millis();
+      String wsMessage;
+      serializeJson(wsDoc, wsMessage);
+      webSocket.broadcastTXT(wsMessage);
+      
+      // Flash LED to indicate success
+      flashLED(2);
+      
+    } else {
+      Serial.println("  ❌ Failed to parse backend response");
+      Serial.println("  Raw: " + response);
+      sendESPNowResult("UNKNOWN", 0.0);
+      sendUARTResult("UNKNOWN", 0.0);
+    }
+  } else {
+    Serial.printf("  ❌ HTTP error: %s\n", http.errorToString(httpResponseCode).c_str());
+    sendESPNowResult("UNKNOWN", 0.0);
+    sendUARTResult("UNKNOWN", 0.0);
+  }
+  
+  http.end();
+}
+
+// ==================== ESP-NOW RESULT SENDING ====================
+void sendESPNowResult(String material, float confidence) {
+  if (!espNowInitialized) {
+    Serial.println("⚠️  ESP-NOW not initialized - skipping wireless send");
+    return;
+  }
+  
+  if (!mainControllerRegistered) {
+    Serial.println("⚠️  ESP32 Main not registered - skipping wireless send");
+    return;
+  }
+  
+  DetectionResult result;
+  strncpy(result.material, material.c_str(), sizeof(result.material) - 1);
+  result.material[sizeof(result.material) - 1] = '\0';
+  result.confidence = confidence;
+  result.timestamp = millis();
+  
+  esp_err_t sendResult = esp_now_send(mainControllerMAC, (uint8_t *)&result, sizeof(result));
+  
+  if (sendResult == ESP_OK) {
+    Serial.printf("📡 ESP-NOW result sent: %s (%.2f%%)\n", material.c_str(), confidence * 100);
+  } else {
+    Serial.println("❌ ESP-NOW send failed");
+  }
+}
+
+// ==================== UART RESULT SENDING ====================
 void sendUARTResult(String material, float confidence) {
-  // Send material detection result via UART
-  // Format: JSON string for easy parsing
   DynamicJsonDocument doc(256);
   doc["material"] = material;
   doc["confidence"] = confidence;
@@ -239,87 +554,10 @@ void sendUARTResult(String material, float confidence) {
   String jsonString;
   serializeJson(doc, jsonString);
   
-  // Send with newline delimiter
   Serial2.println(jsonString);
+  uartResponses++;
   
-  Serial.println(">>> UART TX: " + jsonString);
-}
-
-// ==================== MATERIAL DETECTION ====================
-void detectMaterial() {
-  unsigned long startTime = millis();
-  
-  // Capture image
-  Serial.println("Capturing image...");
-  camera_fb_t * fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("  ❌ Camera capture failed");
-    sendUARTResult("UNKNOWN", 0.0);
-    return;
-  }
-  
-  Serial.printf("  ✓ Image captured: %d bytes\n", fb->len);
-  
-  // Send image to backend for detection
-  sendToBackend(fb->buf, fb->len);
-  
-  // Return frame buffer
-  esp_camera_fb_return(fb);
-  
-  unsigned long elapsed = millis() - startTime;
-  Serial.printf(">>> Total detection time: %lu ms\n\n", elapsed);
-}
-
-// ==================== BACKEND COMMUNICATION ====================
-void sendToBackend(uint8_t* image, size_t len) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("  ❌ WiFi not connected");
-    sendUARTResult("UNKNOWN", 0.0);
-    return;
-  }
-  
-  Serial.println("Sending to backend AI...");
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-
-  http.begin(client, String(backend_url) + "/api/detect");
-  http.addHeader("Content-Type", "image/jpeg");
-  http.setTimeout(8000);  // 8 second timeout
-  
-  int httpResponseCode = http.POST(image, len);
-  
-  if (httpResponseCode > 0) {
-    String response = http.getString();
-    Serial.printf("  ✓ Backend response [%d]: %s\n", httpResponseCode, response.c_str());
-    
-    // Parse response
-    DynamicJsonDocument doc(1024);
-    DeserializationError error = deserializeJson(doc, response);
-    
-    if (!error) {
-      String material = doc["material"];
-      float confidence = doc["confidence"];
-      
-      Serial.println("  ✓ AI Detection Result:");
-      Serial.printf("    Material: %s\n", material.c_str());
-      Serial.printf("    Confidence: %.2f%%\n", confidence * 100);
-      
-      // Send result INSTANTLY via UART to ESP32 Main
-      sendUARTResult(material, confidence);
-      
-      lastDetectedMaterial = material;
-      lastConfidence = confidence;
-    } else {
-      Serial.println("  ❌ Failed to parse backend response");
-      sendUARTResult("UNKNOWN", 0.0);
-    }
-  } else {
-    Serial.printf("  ❌ Backend error: %s\n", http.errorToString(httpResponseCode).c_str());
-    sendUARTResult("UNKNOWN", 0.0);
-  }
-  
-  http.end();
+  Serial.println("📡 UART TX: " + jsonString);
 }
 
 // ==================== AUTHENTICATION ====================
@@ -337,63 +575,129 @@ bool authenticateRequest(AsyncWebServerRequest *request) {
   return false;
 }
 
-// ==================== WEB SERVER SETUP ====================
+// ==================== WEB SERVER ====================
 void setupWebServer() {
-  // Root endpoint
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    String html = "<html><body style='font-family: monospace;'>";
-    html += "<h1>ESP32-CAM Material Detection</h1>";
-    html += "<p><b>Local IP:</b> " + WiFi.localIP().toString() + "</p>";
-    html += "<p><b>UART TX:</b> GPIO 16</p>";
-    html += "<p><b>Trigger:</b> GPIO 33</p>";
-    html += "<p><b>Password:</b> " + String(local_access_password) + "</p>";
-    html += "<hr><h3>Endpoints:</h3>";
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<!DOCTYPE html><html><head>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<meta http-equiv='refresh' content='10'>";  // Auto-refresh every 10s
+    html += "<style>body{font-family:monospace;max-width:800px;margin:20px auto;padding:20px;background:#f5f5f5;}";
+    html += "h1{color:#333;border-bottom:2px solid #4CAF50;}";
+    html += ".card{background:white;padding:15px;margin:10px 0;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}";
+    html += ".status{color:green;font-weight:bold;font-size:1.2em;}";
+    html += ".stat{display:inline-block;margin:10px 20px 10px 0;}";
+    html += ".label{color:#666;font-size:0.9em;}</style></head><body>";
+    html += "<h1>🎥 ESP32-CAM Material Detection</h1>";
+    
+    html += "<div class='card'>";
+    html += "<div class='status'>✅ System Operational</div>";
+    html += "<div class='label'>Uptime: " + String((millis() - bootTime) / 1000) + " seconds</div>";
+    html += "</div>";
+    
+    html += "<div class='card'>";
+    html += "<h3>📡 Communication Status</h3>";
+    html += "<div>ESP-NOW: " + String(espNowInitialized ? "✅ Active" : "❌ Inactive") + "</div>";
+    html += "<div>Main Controller: " + String(mainControllerRegistered ? "✅ Paired" : "⏳ Waiting") + "</div>";
+    html += "<div>WiFi: " + String(WiFi.status() == WL_CONNECTED ? "✅ Connected" : "❌ Disconnected") + "</div>";
+    html += "<div>IP: " + WiFi.localIP().toString() + "</div>";
+    html += "</div>";
+    
+    html += "<div class='card'>";
+    html += "<h3>🔍 Last Detection</h3>";
+    html += "<div><strong>Material:</strong> " + lastDetectedMaterial + "</div>";
+    html += "<div><strong>Confidence:</strong> " + String(lastConfidence * 100, 1) + "%</div>";
+    html += "<div class='label'>Time: " + String((millis() - lastDetectionTime) / 1000) + "s ago</div>";
+    html += "</div>";
+    
+    html += "<div class='card'>";
+    html += "<h3>📊 Statistics</h3>";
+    html += "<div class='stat'><strong>Total:</strong> " + String(totalDetections) + "</div>";
+    html += "<div class='stat'><strong>Wireless Triggers:</strong> " + String(wirelessTriggers) + "</div>";
+    html += "<div class='stat'><strong>GPIO Triggers:</strong> " + String(gpioTriggers) + "</div>";
+    html += "<div class='stat'><strong>Wireless Responses:</strong> " + String(wirelessResponses) + "</div>";
+    html += "<div class='stat'><strong>UART Responses:</strong> " + String(uartResponses) + "</div>";
+    html += "</div>";
+    
+    html += "<div class='card'>";
+    html += "<h3>📍 Pin Configuration</h3>";
+    html += "<div>UART TX: GPIO 14 → ESP32 Main GPIO 15</div>";
+    html += "<div>Trigger: GPIO 13 ← ESP32 Main GPIO 4</div>";
+    html += "<div class='label'>✅ Boot-safe configuration</div>";
+    html += "</div>";
+    
+    html += "<div class='card'>";
+    html += "<h3>🔌 API Endpoints</h3>";
     html += "<ul>";
-    html += "<li>/capture - Capture image (requires auth)</li>";
-    html += "<li>/api/material - Get last detection</li>";
-    html += "<li>/api/detect - Trigger detection (requires auth)</li>";
+    html += "<li><strong>GET</strong> /capture - View camera image (auth)</li>";
+    html += "<li><strong>GET</strong> /api/material - Last detection result</li>";
+    html += "<li><strong>POST</strong> /api/detect - Trigger detection (auth)</li>";
+    html += "<li><strong>GET</strong> /api/stats - System statistics</li>";
     html += "</ul>";
+    html += "</div>";
+    
+    html += "<div class='card label'>";
+    html += "📍 MAC Address: " + WiFi.macAddress();
+    html += "</div>";
+    
     html += "</body></html>";
     request->send(200, "text/html", html);
   });
   
-  // Capture and send image (with auth)
-  server.on("/capture", HTTP_GET, [](AsyncWebServerRequest *request){
+  server.on("/capture", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!authenticateRequest(request)) {
-      request->send(401, "text/plain", "Unauthorized - Password required");
+      request->send(401, "text/plain", "Unauthorized - Add header: Authorization: Bearer SmartBin2025");
       return;
     }
     
-    camera_fb_t * fb = esp_camera_fb_get();
+    camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
       request->send(500, "text/plain", "Camera capture failed");
       return;
     }
     
-    request->send_P(200, "image/jpeg", (const uint8_t*)fb->buf, fb->len);
+    request->send_P(200, "image/jpeg", (const uint8_t *)fb->buf, fb->len);
     esp_camera_fb_return(fb);
   });
   
-  // Get last detected material
-  server.on("/api/material", HTTP_GET, [](AsyncWebServerRequest *request){
-    DynamicJsonDocument doc(256);
+  server.on("/api/material", HTTP_GET, [](AsyncWebServerRequest *request) {
+    DynamicJsonDocument doc(512);
     doc["material"] = lastDetectedMaterial;
     doc["confidence"] = lastConfidence;
+    doc["timestamp"] = lastDetectionTime;
+    doc["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+    doc["espnow_enabled"] = espNowInitialized;
+    doc["main_paired"] = mainControllerRegistered;
     
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
   });
   
-  // Trigger detection (with auth)
-  server.on("/api/detect", HTTP_POST, [](AsyncWebServerRequest *request){
+  server.on("/api/stats", HTTP_GET, [](AsyncWebServerRequest *request) {
+    DynamicJsonDocument doc(512);
+    doc["total_detections"] = totalDetections;
+    doc["wireless_triggers"] = wirelessTriggers;
+    doc["gpio_triggers"] = gpioTriggers;
+    doc["wireless_responses"] = wirelessResponses;
+    doc["uart_responses"] = uartResponses;
+    doc["uptime_seconds"] = (millis() - bootTime) / 1000;
+    doc["espnow_enabled"] = espNowInitialized;
+    doc["main_paired"] = mainControllerRegistered;
+    doc["mac_address"] = WiFi.macAddress();
+    
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+  
+  server.on("/api/detect", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (!authenticateRequest(request)) {
       request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
       return;
     }
     
     detectionRequested = true;
-    request->send(200, "application/json", "{\"status\":\"detecting\"}");
+    request->send(200, "application/json", "{\"status\":\"triggering_detection\"}");
   });
   
   server.begin();
@@ -401,8 +705,8 @@ void setupWebServer() {
 }
 
 // ==================== WEBSOCKET ====================
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-  switch(type) {
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
     case WStype_DISCONNECTED:
       Serial.printf("WS: Client [%u] disconnected\n", num);
       break;
@@ -412,10 +716,12 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         IPAddress ip = webSocket.remoteIP(num);
         Serial.printf("WS: Client [%u] connected from %s\n", num, ip.toString().c_str());
         
-        // Send current status
-        DynamicJsonDocument doc(256);
+        DynamicJsonDocument doc(512);
+        doc["event"] = "connected";
         doc["material"] = lastDetectedMaterial;
         doc["confidence"] = lastConfidence;
+        doc["espnow_enabled"] = espNowInitialized;
+        doc["main_paired"] = mainControllerRegistered;
         String response;
         serializeJson(doc, response);
         webSocket.sendTXT(num, response);
@@ -424,17 +730,32 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
       
     case WStype_TEXT:
       {
-        String message = String((char*)payload);
+        String message = String((char *)payload);
         DynamicJsonDocument doc(256);
         deserializeJson(doc, message);
         
         String cmd = doc["command"];
         if (cmd == "detect") {
           detectionRequested = true;
+          webSocket.sendTXT(num, "{\"status\":\"detecting\"}");
         } else if (cmd == "status") {
-          DynamicJsonDocument resp(256);
+          DynamicJsonDocument resp(512);
           resp["material"] = lastDetectedMaterial;
           resp["confidence"] = lastConfidence;
+          resp["espnow_enabled"] = espNowInitialized;
+          resp["main_paired"] = mainControllerRegistered;
+          resp["total_detections"] = totalDetections;
+          String response;
+          serializeJson(resp, response);
+          webSocket.sendTXT(num, response);
+        } else if (cmd == "stats") {
+          DynamicJsonDocument resp(512);
+          resp["total_detections"] = totalDetections;
+          resp["wireless_triggers"] = wirelessTriggers;
+          resp["gpio_triggers"] = gpioTriggers;
+          resp["wireless_responses"] = wirelessResponses;
+          resp["uart_responses"] = uartResponses;
+          resp["uptime"] = (millis() - bootTime) / 1000;
           String response;
           serializeJson(resp, response);
           webSocket.sendTXT(num, response);
@@ -446,308 +767,15 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
       break;
   }
 }
+// ```
 
+// ---
 
-// #include <Arduino.h>
-// #include <WiFi.h>
-// #include <ESPAsyncWebServer.h>
-// #include <ArduinoJson.h>
-// #include "esp_camera.h"
-// #include "esp_http_server.h"
-// #include <WebSocketsServer.h>
+// # 📋 **SETUP INSTRUCTIONS**
 
-// // ==================== CAMERA PINS (ESP32-CAM) ====================
-// #define PWDN_GPIO_NUM     32
-// #define RESET_GPIO_NUM    -1
-// #define XCLK_GPIO_NUM      0
-// #define SIOD_GPIO_NUM     26
-// #define SIOC_GPIO_NUM     27
-// #define Y9_GPIO_NUM       35
-// #define Y8_GPIO_NUM       34
-// #define Y7_GPIO_NUM       39
-// #define Y6_GPIO_NUM       36
-// #define Y5_GPIO_NUM       21
-// #define Y4_GPIO_NUM       19
-// #define Y3_GPIO_NUM       18
-// #define Y2_GPIO_NUM        5
-// #define VSYNC_GPIO_NUM    25
-// #define HREF_GPIO_NUM     23
-// #define PCLK_GPIO_NUM     22
+// ## **Step 1: Get MAC Addresses**
 
-// // ==================== GLOBAL VARIABLES ====================
-// const char* ssid = "YOUR_WIFI_SSID";
-// const char* password = "YOUR_WIFI_PASSWORD";
-// const char* backend_url = "http://your-backend-url.com";
-
-// WebSocketsServer webSocket(81);
-// AsyncWebServer server(80);
-
-// // Material detection state
-// bool isDetecting = false;
-// String lastDetectedMaterial = "UNKNOWN";
-
-// // ==================== FUNCTION DECLARATIONS ====================
-// void setupCamera();
-// void setupWiFi();
-// void setupWebServer();
-// void setupCAN();
-// void sendCANMessage(uint32_t id, String message);
-// bool receiveCANMessage(uint32_t* id, String* message);
-// void detectMaterial();
-// void sendToBackend(uint8_t* image, size_t len);
-// void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
-
-// // ==================== SETUP ====================
-// void setup() {
-//   Serial.begin(115200);
-//   delay(1000);
-  
-//   // Initialize Camera
-//   setupCamera();
-  
-//   // Initialize WiFi
-//   setupWiFi();
-  
-//   // Initialize CAN
-//   setupCAN();
-  
-//   // Initialize Web Server
-//   setupWebServer();
-  
-//   // Initialize WebSocket
-//   webSocket.begin();
-//   webSocket.onEvent(webSocketEvent);
-  
-//   Serial.println("ESP32-CAM Material Detection System Initialized");
-// }
-
-// // ==================== MAIN LOOP ====================
-// void loop() {
-//   webSocket.loop();
-  
-//   // Check for CAN messages requesting material detection
-//   uint32_t canId;
-//   String canMessage;
-  
-//   if (receiveCANMessage(&canId, &canMessage)) {
-//     if (canId == 0x100 && canMessage == "DETECT_MATERIAL") {
-//       Serial.println("Material detection requested");
-//       isDetecting = true;
-//       detectMaterial();
-//     }
-//   }
-  
-//   delay(100);
-// }
-
-// // ==================== CAMERA SETUP ====================
-// void setupCamera() {
-//   camera_config_t config;
-//   config.ledc_channel = LEDC_CHANNEL_0;
-//   config.ledc_timer = LEDC_TIMER_0;
-//   config.pin_d0 = Y2_GPIO_NUM;
-//   config.pin_d1 = Y3_GPIO_NUM;
-//   config.pin_d2 = Y4_GPIO_NUM;
-//   config.pin_d3 = Y5_GPIO_NUM;
-//   config.pin_d4 = Y6_GPIO_NUM;
-//   config.pin_d5 = Y7_GPIO_NUM;
-//   config.pin_d6 = Y8_GPIO_NUM;
-//   config.pin_d7 = Y9_GPIO_NUM;
-//   config.pin_xclk = XCLK_GPIO_NUM;
-//   config.pin_pclk = PCLK_GPIO_NUM;
-//   config.pin_vsync = VSYNC_GPIO_NUM;
-//   config.pin_href = HREF_GPIO_NUM;
-//   config.pin_sscb_sda = SIOD_GPIO_NUM;
-//   config.pin_sscb_scl = SIOC_GPIO_NUM;
-//   config.pin_pwdn = PWDN_GPIO_NUM;
-//   config.pin_reset = RESET_GPIO_NUM;
-//   config.xclk_freq_hz = 20000000;
-//   config.pixel_format = PIXFORMAT_JPEG;
-  
-//   // Frame size
-//   if(psramFound()){
-//     config.frame_size = FRAMESIZE_VGA;
-//     config.jpeg_quality = 10;
-//     config.fb_count = 2;
-//   } else {
-//     config.frame_size = FRAMESIZE_SVGA;
-//     config.jpeg_quality = 12;
-//     config.fb_count = 1;
-//   }
-  
-//   // Initialize camera
-//   esp_err_t err = esp_camera_init(&config);
-//   if (err != ESP_OK) {
-//     Serial.printf("Camera init failed with error 0x%x", err);
-//     return;
-//   }
-  
-//   Serial.println("Camera initialized successfully");
-// }
-
-// // ==================== WIFI SETUP ====================
-// void setupWiFi() {
-//   WiFi.mode(WIFI_STA);
-//   WiFi.begin(ssid, password);
-  
-//   Serial.print("Connecting to WiFi");
-//   int attempts = 0;
-//   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-//     delay(500);
-//     Serial.print(".");
-//     attempts++;
-//   }
-  
-//   if (WiFi.status() == WL_CONNECTED) {
-//     Serial.println("\nWiFi Connected!");
-//     Serial.print("IP Address: ");
-//     Serial.println(WiFi.localIP());
-//   } else {
-//     Serial.println("\nWiFi Connection Failed");
-//   }
-// }
-
-// // ==================== CAN SETUP ====================
-// void setupCAN() {
-//   // Initialize TWAI (CAN) on ESP32
-//   Serial.println("CAN/TWAI initialized");
-// }
-
-// void sendCANMessage(uint32_t id, String message) {
-//   // Simplified CAN message sending
-//   Serial.printf("CAN TX: ID=0x%03X, Message=%s\n", id, message.c_str());
-// }
-
-// bool receiveCANMessage(uint32_t* id, String* message) {
-//   // Simplified CAN message receiving
-//   // In real implementation, use ESP32 TWAI library
-//   return false;
-// }
-
-// // ==================== MATERIAL DETECTION ====================
-// void detectMaterial() {
-//   // Capture image
-//   camera_fb_t * fb = esp_camera_fb_get();
-//   if (!fb) {
-//     Serial.println("Camera capture failed");
-//     isDetecting = false;
-//     return;
-//   }
-  
-//   Serial.printf("Captured image: %d bytes\n", fb->len);
-  
-//   // Send image to backend for detection
-//   sendToBackend(fb->buf, fb->len);
-  
-//   // Return frame buffer
-//   esp_camera_fb_return(fb);
-  
-//   isDetecting = false;
-// }
-
-// // ==================== BACKEND COMMUNICATION ====================
-// void sendToBackend(uint8_t* image, size_t len) {
-//   if (WiFi.status() != WL_CONNECTED) {
-//     Serial.println("WiFi not connected, cannot send to backend");
-//     // Send CAN message with default response
-//     sendCANMessage(0x200, "MATERIAL:UNKNOWN");
-//     return;
-//   }
-  
-//   HTTPClient http;
-//   http.begin(String(backend_url) + "/api/detect");
-//   http.addHeader("Content-Type", "image/jpeg");
-  
-//   int httpResponseCode = http.POST(image, len);
-  
-//   if (httpResponseCode > 0) {
-//     String response = http.getString();
-//     Serial.printf("Backend response: %d - %s\n", httpResponseCode, response.c_str());
-    
-//     // Parse response
-//     DynamicJsonDocument doc(1024);
-//     DeserializationError error = deserializeJson(doc, response);
-    
-//     if (!error) {
-//       String material = doc["material"];
-//       float confidence = doc["confidence"];
-      
-//       Serial.printf("Detected material: %s (confidence: %.2f)\n", material.c_str(), confidence);
-      
-//       // Send result via CAN
-//       String canMessage = "MATERIAL:" + material;
-//       sendCANMessage(0x200, canMessage);
-      
-//       lastDetectedMaterial = material;
-//     } else {
-//       Serial.println("Failed to parse backend response");
-//       sendCANMessage(0x200, "MATERIAL:UNKNOWN");
-//     }
-//   } else {
-//     Serial.printf("Backend error: %s\n", http.errorToString(httpResponseCode).c_str());
-//     sendCANMessage(0x200, "MATERIAL:UNKNOWN");
-//   }
-  
-//   http.end();
-// }
-
-// // ==================== WEB SERVER SETUP ====================
-// void setupWebServer() {
-//   // Root endpoint
-//   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-//     request->send(200, "text/html", "<html><body><h1>ESP32-CAM Material Detection</h1></body></html>");
-//   });
-  
-//   // Capture and send image
-//   server.on("/capture", HTTP_GET, [](AsyncWebServerRequest *request){
-//     camera_fb_t * fb = esp_camera_fb_get();
-//     if (!fb) {
-//       request->send(500, "text/plain", "Camera capture failed");
-//       return;
-//     }
-    
-//     request->send_P(200, "image/jpeg", (const uint8_t*)fb->buf, fb->len);
-//     esp_camera_fb_return(fb);
-//   });
-  
-//   // Get last detected material
-//   server.on("/api/material", HTTP_GET, [](AsyncWebServerRequest *request){
-//     DynamicJsonDocument doc(256);
-//     doc["material"] = lastDetectedMaterial;
-//     doc["detecting"] = isDetecting;
-    
-//     String response;
-//     serializeJson(doc, response);
-//     request->send(200, "application/json", response);
-//   });
-  
-//   // Trigger detection
-//   server.on("/api/detect", HTTP_POST, [](AsyncWebServerRequest *request){
-//     isDetecting = true;
-//     detectMaterial();
-//     request->send(200, "application/json", "{\"status\":\"detecting\"}");
-//   });
-  
-//   server.begin();
-// }
-
-// // ==================== WEBSOCKET ====================
-// void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-//   switch(type) {
-//     case WStype_DISCONNECTED:
-//       Serial.printf("Client [%u] disconnected\n", num);
-//       break;
-      
-//     case WStype_CONNECTED:
-//       Serial.printf("Client [%u] connected\n", num);
-//       break;
-      
-//     case WStype_TEXT:
-//       // Handle commands
-//       break;
-      
-//     default:
-//       break;
-//   }
-// }
-
+// 1. **Upload ESP32-CAM code first**
+// 2. **Open Serial Monitor** - it will print:
+// ```
+//    📍 ESP32-CAM MAC Address: AA:BB:CC:DD:EE:FF
