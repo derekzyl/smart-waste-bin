@@ -21,8 +21,7 @@
 #define TRIG_PIN_INORG 13
 #define ECHO_PIN_INORG 36
 
-#define TRIG_PIN_INORG 13
-#define ECHO_PIN_INORG 36
+
 
 // PCA9685 SERVO CONFIG
 #define SERVOMIN  150 // This is the 'minimum' pulse length count (out of 4096)
@@ -116,8 +115,7 @@ const unsigned long MOTION_TIMEOUT = 5000;
 const unsigned long BIN_OPEN_TIMEOUT = 10000;
 unsigned long lastLevelCheckTime = 0;
 const unsigned long LEVEL_CHECK_INTERVAL = 2000;
-unsigned long lastLevelCheckTime = 0;
-const unsigned long LEVEL_CHECK_INTERVAL = 2000;
+
 unsigned long lastBackendSyncTime = 0;
 const unsigned long BACKEND_SYNC_INTERVAL = 5000;
 unsigned long lastCommandPollTime = 0;
@@ -876,6 +874,10 @@ void pollBackendCommands() {
       Serial.println("\n>>> Command Received: OPEN ORGANIC");
       selectedBin = BIN_ORGANIC_ID;
       currentState = OPENING_BIN;
+    } else if (payload.indexOf("CLOSE") >= 0) {
+      Serial.println("\n>>> Command Received: CLOSE ORGANIC");
+      selectedBin = BIN_ORGANIC_ID;
+      currentState = CLOSING_BIN;
     }
   }
   http.end();
@@ -891,13 +893,18 @@ void pollBackendCommands() {
       Serial.println("\n>>> Command Received: OPEN INORGANIC");
       selectedBin = BIN_NON_ORGANIC_ID;
       currentState = OPENING_BIN;
+    } else if (payload.indexOf("CLOSE") >= 0) {
+      Serial.println("\n>>> Command Received: CLOSE INORGANIC");
+      selectedBin = BIN_NON_ORGANIC_ID;
+      currentState = CLOSING_BIN;
     }
   }
   http.end();
-}  WiFi.mode(WIFI_AP_STA);  // Both AP and STA for ESP-NOW
-    WiFi.softAP("SmartBin_AP", "12345678");
-  }
-}
+}  
+// WiFi.mode(WIFI_AP_STA);  // Both AP and STA for ESP-NOW
+//     WiFi.softAP("SmartBin_AP", "12345678");
+//   }
+// }
 
 // ==================== WEB SERVER ====================
 bool authenticateRequest(AsyncWebServerRequest *request) {
