@@ -56,10 +56,11 @@ class TemperatureData(BaseModel):
 
 
 class SystemData(BaseModel):
-    battery_percent: int = Field(..., ge=0, le=100)
-    battery_voltage: float
+    battery_percent: int = Field(default=100, ge=0, le=100)
+    battery_voltage: float = Field(default=3.7)
     wifi_rssi: int
     uptime_seconds: int
+    monitoring_state: Optional[str] = "idle"  # 'idle', 'monitoring', or 'paused'
 
 
 class VitalsData(BaseModel):
@@ -142,8 +143,32 @@ class ThresholdResponse(BaseModel):
         from_attributes = True
 
 
+class ThresholdConfig(BaseModel):
+    hr_high: Optional[float] = Field(None, description="Upper heart rate limit")
+    hr_low: Optional[float] = Field(None, description="Lower heart rate limit")
+    spo2_low: Optional[float] = Field(None, description="Low SpO2 warning limit")
+    spo2_critical: Optional[float] = Field(None, description="Critical SpO2 limit")
+    temp_high: Optional[float] = Field(None, description="High temperature limit")
+    temp_low: Optional[float] = Field(None, description="Low temperature limit")
+
+
 # ==================== CALIBRATION SCHEMAS ====================
 
 
-class RestingHRCalibration(BaseModel):
+class CalibrationRequest(BaseModel):
     resting_hr: int = Field(..., ge=40, le=100)
+
+
+# Alias for backward compatibility if needed, or just use CalibrationRequest
+RestingHRCalibration = CalibrationRequest
+
+
+class ThresholdConfig(BaseModel):
+    thresholds: List[ThresholdResponse]
+
+
+# ==================== STATE CONTROL SCHEMAS ====================
+
+
+class StateCommand(BaseModel):
+    state: str  # 'idle', 'monitoring', or 'paused'

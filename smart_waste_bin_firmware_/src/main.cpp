@@ -8,7 +8,7 @@
 #include <esp_now.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
-#include <ESP32Servo.h>
+#include <Adafruit_PWMServoDriver.h> // REPLACES ESP32Servo
 #include <WebSocketsServer.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -21,8 +21,24 @@
 #define TRIG_PIN_INORG 13
 #define ECHO_PIN_INORG 36
 
-#define SERVO_ORGANIC_PIN 18
-#define SERVO_NON_ORGANIC_PIN 19
+#define TRIG_PIN_INORG 13
+#define ECHO_PIN_INORG 36
+
+// PCA9685 SERVO CONFIG
+#define SERVOMIN  150 // This is the 'minimum' pulse length count (out of 4096)
+#define SERVOMAX  600 // This is the 'maximum' pulse length count (out of 4096)
+#define USMIN  600 // This is the rounded 'minimum' microsecond length based on the minimum pulse of 150
+#define USMAX  2400 // This is the rounded 'maximum' microsecond length based on the maximum pulse of 600
+#define SERVO_FREQ 50 // Analog servos run at ~50 Hz updates
+
+// Channels on PCA9685 (0 to 15)
+#define PCA_CHANNEL_ORG 0
+#define PCA_CHANNEL_INORG 1
+
+// I2C Pins for PCA9685
+#define I2C_SDA 21
+#define I2C_SCL 22
+
 #define CAM_TRIGGER_PIN 4
 
 #define LED_ORG_RED_PIN 25
@@ -70,8 +86,8 @@ typedef struct {
 } DetectionResult;
 
 // ==================== GLOBAL VARIABLES ====================
-Servo servoOrganic;
-Servo servoNonOrganic;
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(); // Default address 0x40
+
 AsyncWebServer server(80);
 WebSocketsServer webSocket(81);
 
@@ -100,8 +116,12 @@ const unsigned long MOTION_TIMEOUT = 5000;
 const unsigned long BIN_OPEN_TIMEOUT = 10000;
 unsigned long lastLevelCheckTime = 0;
 const unsigned long LEVEL_CHECK_INTERVAL = 2000;
+unsigned long lastLevelCheckTime = 0;
+const unsigned long LEVEL_CHECK_INTERVAL = 2000;
 unsigned long lastBackendSyncTime = 0;
 const unsigned long BACKEND_SYNC_INTERVAL = 5000;
+unsigned long lastCommandPollTime = 0;
+const unsigned long COMMAND_POLL_INTERVAL = 1000; // FAST POLLING (1s) to reduce latency
 
 const float PRESENCE_THRESHOLD_CM = 50.0;
 const int PRESENCE_DEBOUNCE_COUNT = 3;
@@ -144,7 +164,11 @@ void testAllSensors();
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len);
 void onDataSent(const uint8_t *mac, esp_now_send_status_t status);
 void sendESPNowCommand(const char* cmd);
+void sendESPNowCommand(const char* cmd);
 void testESPNowConnection();
+void pollBackendCommands();
+int angleToPulse(int angle);
+void setServoAngle(uint8_t channel, int angle);
 
 // ==================== SETUP ====================
 void setup() {
@@ -172,10 +196,22 @@ void setup() {
   pinMode(CAM_TRIGGER_PIN, OUTPUT);
   digitalWrite(CAM_TRIGGER_PIN, LOW);
 
-  servoOrganic.attach(SERVO_ORGANIC_PIN);
-  servoNonOrganic.attach(SERVO_NON_ORGANIC_PIN);
-  servoOrganic.write(0);
-  servoNonOrganic.write(0);
+  pinMode(CAM_TRIGGER_PIN, OUTPUT);
+  digitalWrite(CAM_TRIGGER_PIN, LOW);
+
+  // Initialize I2C for PCA9685
+  Wire.begin(I2C_SDA, I2C_SCL);
+  
+  // Initialize PCA9685
+  Serial.println("Initializing PCA9685 Servo Controller on 0x40...");
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(SERVO_FREQ);  // Analog servos run at ~50 Hz updates
+  delay(10);
+
+  // Reset Servos (Close)
+  setServoAngle(PCA_CHANNEL_ORG, 0);
+  setServoAngle(PCA_CHANNEL_INORG, 0);
 
   // LED TEST
   Serial.println("\n>>> LED TEST <<<");
@@ -399,15 +435,20 @@ float getDistanceWaterproof(int trigPin, int echoPin) {
   delayMicroseconds(20);  // Longer pulse for JSN-SR04T
   digitalWrite(trigPin, LOW);
   
-  long duration = pulseIn(echoPin, HIGH, 300000);  // 300ms timeout
+  // Timeout: 30ms (approx 5.1 meters) - excessive for a 90cm bin but safe
+  // Original was 300ms (51 meters) which blocks the loop too long
+  long duration = pulseIn(echoPin, HIGH, 30000); 
   
   if (duration == 0) {
+    Serial.println("    ⚠️ Sensor Timeout (0) - Blind spot or disconnected?");
     return -1;
   }
   
   float distance = (duration * 0.034) / 2;
   
-  if (distance < 2 || distance > 400) {
+  // Validation range: 20cm (min for JSN-SR04T is technically 20cm) to 400cm
+  // If < 20cm, it might read 0 or garbage.
+  if (distance > 400) {
     return -1;
   }
   
@@ -449,15 +490,19 @@ void testAllSensors() {
   
   Serial.println("\n  ORGANIC BIN (Waterproof JSN-SR04T):");
   for (int i = 0; i < 3; i++) {
+    Serial.print("    Reading "); Serial.print(i + 1); Serial.print(": ");
     float dist = getDistanceWaterproof(TRIG_PIN_ORG, ECHO_PIN_ORG);
-    Serial.printf("    Reading %d: %.2f cm\n", i + 1, dist);
+    if (dist == -1) Serial.println("Inv/Timeout");
+    else { Serial.print(dist); Serial.println(" cm"); }
     delay(100);
   }
   
   Serial.println("\n  INORGANIC BIN (Waterproof JSN-SR04T):");
   for (int i = 0; i < 3; i++) {
+    Serial.print("    Reading "); Serial.print(i + 1); Serial.print(": ");
     float dist = getDistanceWaterproof(TRIG_PIN_INORG, ECHO_PIN_INORG);
-    Serial.printf("    Reading %d: %.2f cm\n", i + 1, dist);
+    if (dist == -1) Serial.println("Inv/Timeout");
+    else { Serial.print(dist); Serial.println(" cm"); }
     delay(100);
   }
   
@@ -522,9 +567,33 @@ void loop() {
     lastLevelCheckTime = millis();
   }
 
+  // Poll for commands from Backend (Faster response than sync)
+  if (millis() - lastCommandPollTime > COMMAND_POLL_INTERVAL) {
+    pollBackendCommands();
+    lastCommandPollTime = millis();
+  }
+
   // State Machine
   switch (currentState) {
     case IDLE:
+      // Allow unsolicited results (e.g. from Web UI or manual trigger)
+      if (materialDetectionComplete) {
+        Serial.println("\n>>> Unsolicited detection result received!");
+        
+        if (detectedMaterial == "ORGANIC") {
+          selectedBin = BIN_ORGANIC_ID;
+          Serial.println(">>> Opening organic bin");
+          currentState = OPENING_BIN;
+        } else if (detectedMaterial == "NON_ORGANIC" || detectedMaterial == "INORGANIC") {
+          selectedBin = BIN_NON_ORGANIC_ID;
+          Serial.println(">>> Opening inorganic bin");
+          currentState = OPENING_BIN;
+        } else {
+          Serial.println(">>> UNKNOWN material - ignoring");
+        }
+        
+        materialDetectionComplete = false;
+      }
       break;
 
     case DETECTING_MOTION:
@@ -559,30 +628,53 @@ void loop() {
       break;
 
     case OPENING_BIN:
-      if (selectedBin == BIN_ORGANIC_ID && !isOrganicBinFull) {
-        openBin(0);
-        currentState = BIN_OPEN;
-        binOpenTime = millis();
-        lastMotionTime = millis();
-      } else if (selectedBin == BIN_NON_ORGANIC_ID && !isNonOrganicBinFull) {
-        openBin(1);
-        currentState = BIN_OPEN;
-        binOpenTime = millis();
-        lastMotionTime = millis();
+      // Check organic bin
+      if (selectedBin == BIN_ORGANIC_ID) {
+        if (!isOrganicBinFull) {
+          openBin(0);
+          currentState = BIN_OPEN;
+          binOpenTime = millis();
+          lastMotionTime = millis();
+        } else {
+          Serial.println("❌ ORGANIC BIN FULL - Staying Closed");
+          currentState = IDLE;
+        }
+      } 
+      // Check inorganic bin
+      else if (selectedBin == BIN_NON_ORGANIC_ID) {
+        if (!isNonOrganicBinFull) {
+          openBin(1);
+          currentState = BIN_OPEN;
+          binOpenTime = millis();
+          lastMotionTime = millis();
+        } else {
+          Serial.println("❌ INORGANIC BIN FULL - Staying Closed");
+          currentState = IDLE;
+        }
       } else {
-        Serial.println("❌ Bin full");
+        Serial.println("❌ Unknown bin selected");
         currentState = IDLE;
       }
       break;
 
     case BIN_OPEN:
       {
+        // Extend open time if motion detected (someone is still throwing trash)
         float distance = getDistanceStandard(TRIG_PIN_PRESENCE, ECHO_PIN_PRESENCE);
         if (distance > 0 && distance < PRESENCE_THRESHOLD_CM) {
           lastMotionTime = millis();
+          Serial.println("  User present - extending open time");
         }
 
-        if (millis() - lastMotionTime > MOTION_TIMEOUT || millis() - binOpenTime > BIN_OPEN_TIMEOUT) {
+        // Auto Close Logic
+        // Close if:
+        // 1. No motion for MOTION_TIMEOUT (5s)
+        // 2. OR Absolute max time of BIN_OPEN_TIMEOUT (10s) reached
+        unsigned long timeSinceMotion = millis() - lastMotionTime;
+        unsigned long timeSinceOpen = millis() - binOpenTime;
+        
+        if (timeSinceMotion > MOTION_TIMEOUT || timeSinceOpen > BIN_OPEN_TIMEOUT) {
+          Serial.println(">>> Auto-closing bin...");
           currentState = CLOSING_BIN;
         }
       }
@@ -594,7 +686,7 @@ void loop() {
       } else {
         closeBin(1);
       }
-      Serial.println(">>> Returning to IDLE\n");
+      Serial.println(">>> Bin Closed. Returning to IDLE\n");
       currentState = IDLE;
       break;
   }
@@ -640,24 +732,30 @@ void updateBinLevels() {
   }
 }
 
-// ==================== BIN CONTROL ====================
+// ==================== BIN CONTROL (PCA9685) ====================
+void setServoAngle(uint8_t channel, int angle) {
+  // Map angle (0-180) to pulse length (SERVOMIN-SERVOMAX)
+  int pulse = map(angle, 0, 180, SERVOMIN, SERVOMAX);
+  pwm.setPWM(channel, 0, pulse);
+}
+
 void openBin(uint8_t binType) {
   if (binType == 0) {
-    servoOrganic.write(90);
-    Serial.println("  ✓ Organic bin OPENED");
+    setServoAngle(PCA_CHANNEL_ORG, 90); // 90 degrees
+    Serial.println("  ✓ Organic bin OPENED (PCA Ch 0)");
   } else {
-    servoNonOrganic.write(90);
-    Serial.println("  ✓ Inorganic bin OPENED");
+    setServoAngle(PCA_CHANNEL_INORG, 90); // 90 degrees
+    Serial.println("  ✓ Inorganic bin OPENED (PCA Ch 1)");
   }
 }
 
 void closeBin(uint8_t binType) {
   if (binType == 0) {
-    servoOrganic.write(0);
-    Serial.println("  ✓ Organic bin CLOSED");
+    setServoAngle(PCA_CHANNEL_ORG, 0); // 0 degrees
+    Serial.println("  ✓ Organic bin CLOSED (PCA Ch 0)");
   } else {
-    servoNonOrganic.write(0);
-    Serial.println("  ✓ Inorganic bin CLOSED");
+    setServoAngle(PCA_CHANNEL_INORG, 0); // 0 degrees
+    Serial.println("  ✓ Inorganic bin CLOSED (PCA Ch 1)");
   }
 }
 
@@ -697,6 +795,22 @@ void testAllLEDs() {
     delay(200);
     digitalWrite(LED_PINS[i], LOW);
   }
+}
+
+void testServos() {
+  Serial.println("  Testing Organic Servo (PCA Ch 0)...");
+  setServoAngle(PCA_CHANNEL_ORG, 90);  // Open
+  delay(1000);
+  setServoAngle(PCA_CHANNEL_ORG, 0);   // Close
+  delay(500);
+  
+  Serial.println("  Testing Inorganic Servo (PCA Ch 1)...");
+  setServoAngle(PCA_CHANNEL_INORG, 90); // Open
+  delay(1000);
+  setServoAngle(PCA_CHANNEL_INORG, 0);  // Close
+  delay(500);
+  
+  Serial.println("  ✓ Servo diagnostic complete");
 }
 
 // ==================== UART ====================
@@ -741,7 +855,46 @@ void setupWiFi() {
     Serial.println(WiFi.channel());
   } else {
     Serial.println("\n  ⚠️  WiFi Failed - using AP mode");
-    WiFi.mode(WIFI_AP_STA);  // Both AP and STA for ESP-NOW
+  }
+}
+
+// ==================== COMMAND POLLING (LATENCY FIX) ====================
+void pollBackendCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  // Poll Organic Bin Commands
+  HTTPClient http;
+  String url = String(backend_url) + "/api/bins/" + String(BIN_ORGANIC_ID) + "/commands";
+  
+  http.begin(url);
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    // Simple check - optimize JSON parsing if needed
+    if (payload.indexOf("OPEN") >= 0) {
+      Serial.println("\n>>> Command Received: OPEN ORGANIC");
+      selectedBin = BIN_ORGANIC_ID;
+      currentState = OPENING_BIN;
+    }
+  }
+  http.end();
+  
+  // Poll Inorganic Bin Commands (Sequential to avoid heap issues)
+  url = String(backend_url) + "/api/bins/" + String(BIN_NON_ORGANIC_ID) + "/commands";
+  http.begin(url);
+  httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    if (payload.indexOf("OPEN") >= 0) {
+      Serial.println("\n>>> Command Received: OPEN INORGANIC");
+      selectedBin = BIN_NON_ORGANIC_ID;
+      currentState = OPENING_BIN;
+    }
+  }
+  http.end();
+}  WiFi.mode(WIFI_AP_STA);  // Both AP and STA for ESP-NOW
     WiFi.softAP("SmartBin_AP", "12345678");
   }
 }
