@@ -87,6 +87,24 @@ typedef struct {
 // ==================== GLOBAL VARIABLES ====================
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(); // Default address 0x40
 
+// ==================== NEWPING SENSOR SETUP ====================
+#include <NewPing.h>
+
+#define MAX_DISTANCE 200 // Maximum distance we want to ping for (in centimeters).
+
+// Sensor Objects
+NewPing sonarPresence(TRIG_PIN_PRESENCE, ECHO_PIN_PRESENCE, MAX_DISTANCE);
+NewPing sonarOrganic(TRIG_PIN_ORG, ECHO_PIN_ORG, MAX_DISTANCE);
+NewPing sonarInorganic(TRIG_PIN_INORG, ECHO_PIN_INORG, MAX_DISTANCE);
+
+// Helper to get median distance (filters noise)
+float getFilteredDistance(NewPing &sonar) {
+  unsigned int uS = sonar.ping_median(5); // Take 5 readings and return median
+  float dist = sonar.convert_cm(uS);
+  if (dist == 0) return -1.0; // Timeout or out of range
+  return dist;
+}
+
 AsyncWebServer server(80);
 WebSocketsServer webSocket(81);
 
@@ -149,8 +167,7 @@ void updateBinLevels();
 void updateLEDs();
 void sendBinDataToBackend();
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
-float getDistanceStandard(int trigPin, int echoPin);
-float getDistanceWaterproof(int trigPin, int echoPin);
+
 void triggerCameraDetection();
 void processUARTData();
 bool authenticateRequest(AsyncWebServerRequest *request);
@@ -167,6 +184,7 @@ void testESPNowConnection();
 void pollBackendCommands();
 int angleToPulse(int angle);
 void setServoAngle(uint8_t channel, int angle);
+void broadcastDetectionEvent(String material, float confidence, String action);
 
 // ==================== SETUP ====================
 void setup() {
@@ -425,87 +443,25 @@ void testESPNowConnection() {
   }
 }
 
-// ==================== WATERPROOF ULTRASONIC ====================
-float getDistanceWaterproof(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(20);  // Longer pulse for JSN-SR04T
-  digitalWrite(trigPin, LOW);
+
+
+// ==================== WEBSOCKET BROADCAST ====================
+void broadcastDetectionEvent(String material, float confidence, String action) {
+  // Create JSON message for App
+  DynamicJsonDocument doc(512);
+  doc["type"] = "DETECTION_EVENT";
+  doc["material"] = material;
+  doc["confidence"] = confidence;
+  doc["action"] = action; // "OPENING" or "CLOSING"
+
+  String jsonString;
+  serializeJson(doc, jsonString);
   
-  // Timeout: 30ms (approx 5.1 meters) - excessive for a 90cm bin but safe
-  // Original was 300ms (51 meters) which blocks the loop too long
-  long duration = pulseIn(echoPin, HIGH, 30000); 
-  
-  if (duration == 0) {
-    Serial.println("    ⚠️ Sensor Timeout (0) - Blind spot or disconnected?");
-    return -1;
-  }
-  
-  float distance = (duration * 0.034) / 2;
-  
-  // Validation range: 20cm (min for JSN-SR04T is technically 20cm) to 400cm
-  // If < 20cm, it might read 0 or garbage.
-  if (distance > 400) {
-    return -1;
-  }
-  
-  return distance;
+  // Broadcast to all connected WebSocket clients (The App)
+  webSocket.broadcastTXT(jsonString);
+  Serial.println("📡 WebSocket Broadcast: " + jsonString);
 }
 
-float getDistanceStandard(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-  
-  long duration = pulseIn(echoPin, HIGH, 30000);
-  
-  if (duration == 0) {
-    return -1;
-  }
-  
-  float distance = (duration * 0.034) / 2;
-  
-  if (distance < 2 || distance > 400) {
-    return -1;
-  }
-  
-  return distance;
-}
-
-// ==================== SENSOR TEST ====================
-void testAllSensors() {
-  Serial.println("  Testing sensors (3 readings each):\n");
-  
-  Serial.println("  PRESENCE (Standard HC-SR04):");
-  for (int i = 0; i < 3; i++) {
-    float dist = getDistanceStandard(TRIG_PIN_PRESENCE, ECHO_PIN_PRESENCE);
-    Serial.printf("    Reading %d: %.2f cm\n", i + 1, dist);
-    delay(100);
-  }
-  
-  Serial.println("\n  ORGANIC BIN (Waterproof JSN-SR04T):");
-  for (int i = 0; i < 3; i++) {
-    Serial.print("    Reading "); Serial.print(i + 1); Serial.print(": ");
-    float dist = getDistanceWaterproof(TRIG_PIN_ORG, ECHO_PIN_ORG);
-    if (dist == -1) Serial.println("Inv/Timeout");
-    else { Serial.print(dist); Serial.println(" cm"); }
-    delay(100);
-  }
-  
-  Serial.println("\n  INORGANIC BIN (Waterproof JSN-SR04T):");
-  for (int i = 0; i < 3; i++) {
-    Serial.print("    Reading "); Serial.print(i + 1); Serial.print(": ");
-    float dist = getDistanceWaterproof(TRIG_PIN_INORG, ECHO_PIN_INORG);
-    if (dist == -1) Serial.println("Inv/Timeout");
-    else { Serial.print(dist); Serial.println(" cm"); }
-    delay(100);
-  }
-  
-  Serial.println("\n  ✓ Sensor test complete\n");
-}
 
 // ==================== MAIN LOOP ====================
 void loop() {
@@ -514,8 +470,8 @@ void loop() {
 
   // Presence detection
   static unsigned long lastPresenceCheck = 0;
-  if (millis() - lastPresenceCheck >= 100) {
-    float distance = getDistanceStandard(TRIG_PIN_PRESENCE, ECHO_PIN_PRESENCE);
+  if (millis() - lastPresenceCheck >= 200) { // Slight delay increase for stability
+    float distance = getFilteredDistance(sonarPresence); // Uses median filter
 
     if (distance > 0 && distance < PRESENCE_THRESHOLD_CM) {
       if (!presenceDetectedForChase) {
@@ -555,7 +511,7 @@ void loop() {
     static int readingCount = 0;
     if (readingCount++ % 10 == 0) {
       Serial.println("\n📊 Sensor Readings:");
-      Serial.printf("   Presence:  %.2f cm\n", getDistanceStandard(TRIG_PIN_PRESENCE, ECHO_PIN_PRESENCE));
+      Serial.printf("   Presence:  %.2f cm\n", getFilteredDistance(sonarPresence));
       Serial.printf("   Organic:   %.2f cm (%d%%)\n", organicBinLevelCm, organicBinLevelPct);
       Serial.printf("   Inorganic: %.2f cm (%d%%)\n", nonOrganicBinLevelCm, nonOrganicBinLevelPct);
       Serial.printf("   ESP-NOW: Sent=%d, Received=%d, Failed=%d\n", 
@@ -565,8 +521,11 @@ void loop() {
     lastLevelCheckTime = millis();
   }
 
-  // Poll for commands from Backend (Faster response than sync)
-  if (millis() - lastCommandPollTime > COMMAND_POLL_INTERVAL) {
+  // Poll for commands from Backend - use faster interval when waiting for cloud result
+  unsigned long pollInterval = (currentState == ANALYZING_MATERIAL)
+    ? 250u
+    : COMMAND_POLL_INTERVAL;
+  if (millis() - lastCommandPollTime > pollInterval) {
     pollBackendCommands();
     lastCommandPollTime = millis();
   }
@@ -598,6 +557,7 @@ void loop() {
       currentState = ANALYZING_MATERIAL;
       materialDetectionStartTime = millis();
       triggerCameraDetection();
+      broadcastDetectionEvent("", 0.0f, "ANALYZING");
       break;
 
     case ANALYZING_MATERIAL:
@@ -614,6 +574,7 @@ void loop() {
           break;
         }
 
+        broadcastDetectionEvent(detectedMaterial, detectedConfidence, "OPENING");
         currentState = OPENING_BIN;
         materialDetectionComplete = false;
       }
@@ -658,7 +619,7 @@ void loop() {
     case BIN_OPEN:
       {
         // Extend open time if motion detected (someone is still throwing trash)
-        float distance = getDistanceStandard(TRIG_PIN_PRESENCE, ECHO_PIN_PRESENCE);
+        float distance = getFilteredDistance(sonarPresence);
         if (distance > 0 && distance < PRESENCE_THRESHOLD_CM) {
           lastMotionTime = millis();
           Serial.println("  User present - extending open time");
@@ -684,6 +645,11 @@ void loop() {
       } else {
         closeBin(1);
       }
+      broadcastDetectionEvent(
+        selectedBin == BIN_ORGANIC_ID ? "ORGANIC" : "NON_ORGANIC",
+        0.0f,
+        "CLOSING"
+      );
       Serial.println(">>> Bin Closed. Returning to IDLE\n");
       currentState = IDLE;
       break;
@@ -708,8 +674,33 @@ void triggerCameraDetection() {
 }
 
 // ==================== BIN LEVEL MONITORING ====================
+
+
+// ==================== SENSOR TEST ====================
+void testAllSensors() {
+  Serial.println("  Testing sensors (NewPing Median Filter):\n");
+  
+  Serial.println("  PRESENCE:");
+  float dist = getFilteredDistance(sonarPresence);
+  Serial.printf("    Distance: %.2f cm\n", dist);
+  
+  Serial.println("\n  ORGANIC BIN (AJ-SR04M / SR04M-2):");
+  dist = getFilteredDistance(sonarOrganic);
+  if (dist == -1) Serial.println("    Result: Timeout / Blind Spot");
+  else Serial.printf("    Result: %.2f cm\n", dist);
+  
+  Serial.println("\n  INORGANIC BIN (AJ-SR04M / SR04M-2):");
+  dist = getFilteredDistance(sonarInorganic);
+  if (dist == -1) Serial.println("    Result: Timeout / Blind Spot");
+  else Serial.printf("    Result: %.2f cm\n", dist);
+  
+  Serial.println("\n  ✓ Sensor test complete\n");
+}
+
+// ==================== BIN LEVEL MONITORING ====================
 void updateBinLevels() {
-  float distOrg = getDistanceWaterproof(TRIG_PIN_ORG, ECHO_PIN_ORG);
+  // Organic
+  float distOrg = getFilteredDistance(sonarOrganic);
   if (distOrg > 0) {
     organicBinLevelCm = distOrg;
     float maxDist = MAX_BIN_HEIGHT_CM + SENSOR_OFFSET_CM;
@@ -717,9 +708,13 @@ void updateBinLevels() {
     organicBinLevelPct = map(constrain(distOrg, minDist, maxDist),
                              maxDist, minDist, 0, 100);
     isOrganicBinFull = (organicBinLevelPct >= 90);
+  } else {
+    // Keep internal state or mark as error? 
+    // For now, don't update if reading is invalid to avoid flickering
   }
 
-  float distInorg = getDistanceWaterproof(TRIG_PIN_INORG, ECHO_PIN_INORG);
+  // Organic
+  float distInorg = getFilteredDistance(sonarInorganic);
   if (distInorg > 0) {
     nonOrganicBinLevelCm = distInorg;
     float maxDist = MAX_BIN_HEIGHT_CM + SENSOR_OFFSET_CM;
@@ -869,34 +864,73 @@ void pollBackendCommands() {
   
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
-    // Simple check - optimize JSON parsing if needed
-    if (payload.indexOf("OPEN") >= 0) {
-      Serial.println("\n>>> Command Received: OPEN ORGANIC");
-      selectedBin = BIN_ORGANIC_ID;
-      currentState = OPENING_BIN;
-    } else if (payload.indexOf("CLOSE") >= 0) {
-      Serial.println("\n>>> Command Received: CLOSE ORGANIC");
-      selectedBin = BIN_ORGANIC_ID;
-      currentState = CLOSING_BIN;
+    
+    // Parse JSON Response
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error) {
+      JsonArray commands = doc["commands"];
+      
+      for (JsonObject cmd : commands) {
+        String commandType = cmd["command"].as<String>();
+        JsonObject params = cmd["params"];
+        
+        if (commandType == "OPEN") {
+          Serial.println("\n>>> Command Received: OPEN ORGANIC");
+          selectedBin = BIN_ORGANIC_ID;
+          currentState = OPENING_BIN;
+          
+          // EXTRACT METADATA & BROADCAST
+          String mat = params["material"] | "Organic";
+          float conf = params["confidence"] | 0.95;
+          broadcastDetectionEvent(mat, conf, "OPENING");
+          
+        } else if (commandType == "CLOSE") {
+          Serial.println("\n>>> Command Received: CLOSE ORGANIC");
+          selectedBin = BIN_ORGANIC_ID;
+          currentState = CLOSING_BIN;
+        }
+      }
     }
   }
   http.end();
   
-  // Poll Inorganic Bin Commands (Sequential to avoid heap issues)
+  // Poll Inorganic Bin Commands (Sequential)
   url = String(backend_url) + "/api/bins/" + String(BIN_NON_ORGANIC_ID) + "/commands";
   http.begin(url);
   httpCode = http.GET();
   
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
-    if (payload.indexOf("OPEN") >= 0) {
-      Serial.println("\n>>> Command Received: OPEN INORGANIC");
-      selectedBin = BIN_NON_ORGANIC_ID;
-      currentState = OPENING_BIN;
-    } else if (payload.indexOf("CLOSE") >= 0) {
-      Serial.println("\n>>> Command Received: CLOSE INORGANIC");
-      selectedBin = BIN_NON_ORGANIC_ID;
-      currentState = CLOSING_BIN;
+    
+    // Parse JSON Response
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error) {
+      JsonArray commands = doc["commands"];
+      
+      for (JsonObject cmd : commands) {
+        String commandType = cmd["command"].as<String>();
+        JsonObject params = cmd["params"];
+        
+        if (commandType == "OPEN") {
+          Serial.println("\n>>> Command Received: OPEN INORGANIC");
+          selectedBin = BIN_NON_ORGANIC_ID;
+          currentState = OPENING_BIN;
+          
+          // EXTRACT METADATA & BROADCAST
+          String mat = params["material"] | "Inorganic";
+          float conf = params["confidence"] | 0.95;
+          broadcastDetectionEvent(mat, conf, "OPENING");
+          
+        } else if (commandType == "CLOSE") {
+          Serial.println("\n>>> Command Received: CLOSE INORGANIC");
+          selectedBin = BIN_NON_ORGANIC_ID;
+          currentState = CLOSING_BIN;
+        }
+      }
     }
   }
   http.end();

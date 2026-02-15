@@ -29,15 +29,19 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     _animationController.forward();
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      context.read<BinProvider>().loadBins();
-      context.read<BinProvider>().startWebSocketConnection();
+      final provider = context.read<BinProvider>();
+      provider.loadBins();
+      provider.startWebSocketConnection();
+      provider.startSimulationDetectionPoll();
     });
   }
 
   @override
   void dispose() {
     _animationController.dispose();
-    context.read<BinProvider>().stopWebSocketConnection();
+    final provider = context.read<BinProvider>();
+    provider.stopWebSocketConnection();
+    provider.stopSimulationDetectionPoll();
     super.dispose();
   }
 
@@ -88,6 +92,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
+                              // Detection status (processing / result / opening)
+                              _DetectionStatusBanner(provider: provider),
                               // Statistics Card
                               if (provider.stats.isNotEmpty)
                                 Padding(
@@ -382,6 +388,85 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           padding: const EdgeInsets.symmetric(vertical: 16),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DetectionStatusBanner extends StatelessWidget {
+  const _DetectionStatusBanner({required this.provider});
+
+  final BinProvider provider;
+
+  @override
+  Widget build(BuildContext context) {
+    final status = provider.detectionStatus;
+    if (status == DetectionStatus.idle) return const SizedBox.shrink();
+
+    final theme = Theme.of(context);
+    IconData icon;
+    String label;
+    Color color;
+
+    switch (status) {
+      case DetectionStatus.analyzing:
+        icon = Icons.search;
+        label = 'Analyzing material...';
+        color = Colors.orange;
+        break;
+      case DetectionStatus.opening:
+        final mat = provider.lastDetectionMaterial;
+        final pct = (provider.lastDetectionConfidence * 100).round();
+        label = mat.isNotEmpty
+            ? '${mat == 'ORGANIC' ? 'Organic' : 'Non-organic'} ($pct%) — Opening bin'
+            : 'Opening bin';
+        icon = Icons.open_in_new;
+        color = Colors.green;
+        break;
+      case DetectionStatus.closing:
+        label = 'Closing bin';
+        icon = Icons.close;
+        color = Colors.grey;
+        break;
+      default:
+        return const SizedBox.shrink();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Material(
+        elevation: 2,
+        borderRadius: BorderRadius.circular(12),
+        color: color.withOpacity(0.15),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
+            children: [
+              if (status == DetectionStatus.analyzing)
+                SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation<Color>(color),
+                  ),
+                )
+              else
+                Icon(icon, color: color, size: 24),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: color.withOpacity(0.9),
+                    fontSize: 14,
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
       ),

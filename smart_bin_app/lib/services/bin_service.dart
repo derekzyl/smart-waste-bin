@@ -55,6 +55,23 @@ class BinService {
     }
   }
 
+  /// Get recent detections (for simulation mode to show last result).
+  Future<List<Map<String, dynamic>>> getDetections({int limit = 1}) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$baseUrl/api/detections').replace(queryParameters: {'limit': limit.toString()}),
+      );
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        final list = data['detections'] as List<dynamic>? ?? [];
+        return list.cast<Map<String, dynamic>>();
+      }
+      return [];
+    } catch (e) {
+      return [];
+    }
+  }
+
   Future<bool> openBin(String binType, {String? esp32Ip}) async {
     try {
       if (esp32Ip != null) {

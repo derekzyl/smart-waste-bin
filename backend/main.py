@@ -330,7 +330,11 @@ async def detect_material(
                 fallback_cmd = CommandQueue(
                     bin_id=target_bin_id,
                     command="OPEN",
-                    params=json.dumps({"source": "cloud_fallback"}),
+                    params=json.dumps({
+                        "source": "cloud_fallback",
+                        "material": result.get("material"),
+                        "confidence": result.get("confidence"),
+                    }),
                 )
                 db.add(fallback_cmd)
                 db.commit()
