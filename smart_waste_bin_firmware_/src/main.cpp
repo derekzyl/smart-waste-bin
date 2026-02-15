@@ -137,7 +137,8 @@ const unsigned long LEVEL_CHECK_INTERVAL = 2000;
 unsigned long lastBackendSyncTime = 0;
 const unsigned long BACKEND_SYNC_INTERVAL = 5000;
 unsigned long lastCommandPollTime = 0;
-const unsigned long COMMAND_POLL_INTERVAL = 1000; // FAST POLLING (1s) to reduce latency
+const unsigned long COMMAND_POLL_INTERVAL = 800;   // Normal: poll every 800ms
+const unsigned long COMMAND_POLL_FAST_MS = 100;    // When analyzing: poll every 100ms for low latency
 
 const float PRESENCE_THRESHOLD_CM = 50.0;
 const int PRESENCE_DEBOUNCE_COUNT = 3;
@@ -152,6 +153,9 @@ bool presenceDetectedForChase = false;
 unsigned long lastChaseUpdate = 0;
 const unsigned long CHASE_SPEED = 100;
 int chasePosition = 0;
+
+// When true, OPENING_BIN will open the bin even if level sensors say "full" (backend command)
+bool openFromBackendCommand = false;
 const int LED_PINS[] = {LED_ORG_GREEN_PIN, LED_ORG_RED_PIN, LED_INORG_GREEN_PIN, LED_INORG_RED_PIN};
 const int NUM_LEDS = 4;
 
@@ -468,9 +472,9 @@ void loop() {
   webSocket.loop();
   processUARTData();
 
-  // Presence detection
+  // Presence detection (100ms for faster reaction)
   static unsigned long lastPresenceCheck = 0;
-  if (millis() - lastPresenceCheck >= 200) { // Slight delay increase for stability
+  if (millis() - lastPresenceCheck >= 100) {
     float distance = getFilteredDistance(sonarPresence); // Uses median filter
 
     if (distance > 0 && distance < PRESENCE_THRESHOLD_CM) {
@@ -521,9 +525,9 @@ void loop() {
     lastLevelCheckTime = millis();
   }
 
-  // Poll for commands from Backend - use faster interval when waiting for cloud result
+  // Poll for commands from Backend - aggressive when waiting for cloud result
   unsigned long pollInterval = (currentState == ANALYZING_MATERIAL)
-    ? 250u
+    ? COMMAND_POLL_FAST_MS
     : COMMAND_POLL_INTERVAL;
   if (millis() - lastCommandPollTime > pollInterval) {
     pollBackendCommands();
@@ -586,10 +590,15 @@ void loop() {
       }
       break;
 
-    case OPENING_BIN:
-      // Check organic bin
+    case OPENING_BIN: {
+      // Backend/cloud command: always open (bypass full check so detection always opens bin)
+      bool allowOpen = openFromBackendCommand ||
+        (selectedBin == BIN_ORGANIC_ID && !isOrganicBinFull) ||
+        (selectedBin == BIN_NON_ORGANIC_ID && !isNonOrganicBinFull);
+      openFromBackendCommand = false;
+
       if (selectedBin == BIN_ORGANIC_ID) {
-        if (!isOrganicBinFull) {
+        if (allowOpen) {
           openBin(0);
           currentState = BIN_OPEN;
           binOpenTime = millis();
@@ -598,10 +607,8 @@ void loop() {
           Serial.println("❌ ORGANIC BIN FULL - Staying Closed");
           currentState = IDLE;
         }
-      } 
-      // Check inorganic bin
-      else if (selectedBin == BIN_NON_ORGANIC_ID) {
-        if (!isNonOrganicBinFull) {
+      } else if (selectedBin == BIN_NON_ORGANIC_ID) {
+        if (allowOpen) {
           openBin(1);
           currentState = BIN_OPEN;
           binOpenTime = millis();
@@ -615,6 +622,7 @@ void loop() {
         currentState = IDLE;
       }
       break;
+    }
 
     case BIN_OPEN:
       {
@@ -851,89 +859,69 @@ void setupWiFi() {
   }
 }
 
-// ==================== COMMAND POLLING (LATENCY FIX) ====================
+// ==================== COMMAND POLLING (SINGLE REQUEST = LOW LATENCY) ====================
 void pollBackendCommands() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  // Poll Organic Bin Commands
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
-  String url = String(backend_url) + "/api/bins/" + String(BIN_ORGANIC_ID) + "/commands";
-  
-  http.begin(url);
+  // Single endpoint for both bins = one HTTPS round-trip instead of two
+  String url = String(backend_url) + "/api/bins/commands";
+  http.begin(client, url);
+  http.setTimeout(5000);
   int httpCode = http.GET();
-  
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    
-    // Parse JSON Response
-    DynamicJsonDocument doc(2048);
-    DeserializationError error = deserializeJson(doc, payload);
 
-    if (!error) {
-      JsonArray commands = doc["commands"];
-      
-      for (JsonObject cmd : commands) {
-        String commandType = cmd["command"].as<String>();
-        JsonObject params = cmd["params"];
-        
-        if (commandType == "OPEN") {
-          Serial.println("\n>>> Command Received: OPEN ORGANIC");
-          selectedBin = BIN_ORGANIC_ID;
-          currentState = OPENING_BIN;
-          
-          // EXTRACT METADATA & BROADCAST
-          String mat = params["material"] | "Organic";
-          float conf = params["confidence"] | 0.95;
-          broadcastDetectionEvent(mat, conf, "OPENING");
-          
-        } else if (commandType == "CLOSE") {
-          Serial.println("\n>>> Command Received: CLOSE ORGANIC");
-          selectedBin = BIN_ORGANIC_ID;
-          currentState = CLOSING_BIN;
-        }
-      }
+  if (httpCode != HTTP_CODE_OK) {
+    if (httpCode > 0) Serial.printf("  ⚠️ GET /api/bins/commands HTTP %d\n", httpCode);
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(2048);
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.printf("  ⚠️ JSON parse error: %s\n", error.c_str());
+    return;
+  }
+
+  JsonArray commands = doc["commands"];
+  for (JsonObject cmd : commands) {
+    String binId = cmd["bin_id"].as<String>();
+    String commandType = cmd["command"].as<String>();
+    JsonObject params = cmd["params"];
+
+    if (commandType == "OPEN") {
+      if (binId == BIN_ORGANIC_ID) {
+        Serial.println("\n>>> Command Received: OPEN ORGANIC (backend)");
+        selectedBin = BIN_ORGANIC_ID;
+      } else if (binId == BIN_NON_ORGANIC_ID) {
+        Serial.println("\n>>> Command Received: OPEN INORGANIC (backend)");
+        selectedBin = BIN_NON_ORGANIC_ID;
+      } else
+        continue;
+      currentState = OPENING_BIN;
+      openFromBackendCommand = true;
+      String mat = params["material"].as<String>();
+      if (mat.length() == 0) mat = (selectedBin == BIN_ORGANIC_ID) ? "Organic" : "Inorganic";
+      float conf = params["confidence"].as<float>();
+      if (conf <= 0.0f) conf = 0.95f;
+      broadcastDetectionEvent(mat, conf, "OPENING");
+    } else if (commandType == "CLOSE") {
+      if (binId == BIN_ORGANIC_ID) {
+        Serial.println("\n>>> Command Received: CLOSE ORGANIC");
+        selectedBin = BIN_ORGANIC_ID;
+      } else if (binId == BIN_NON_ORGANIC_ID) {
+        Serial.println("\n>>> Command Received: CLOSE INORGANIC");
+        selectedBin = BIN_NON_ORGANIC_ID;
+      } else
+        continue;
+      currentState = CLOSING_BIN;
     }
   }
-  http.end();
-  
-  // Poll Inorganic Bin Commands (Sequential)
-  url = String(backend_url) + "/api/bins/" + String(BIN_NON_ORGANIC_ID) + "/commands";
-  http.begin(url);
-  httpCode = http.GET();
-  
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    
-    // Parse JSON Response
-    DynamicJsonDocument doc(2048);
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (!error) {
-      JsonArray commands = doc["commands"];
-      
-      for (JsonObject cmd : commands) {
-        String commandType = cmd["command"].as<String>();
-        JsonObject params = cmd["params"];
-        
-        if (commandType == "OPEN") {
-          Serial.println("\n>>> Command Received: OPEN INORGANIC");
-          selectedBin = BIN_NON_ORGANIC_ID;
-          currentState = OPENING_BIN;
-          
-          // EXTRACT METADATA & BROADCAST
-          String mat = params["material"] | "Inorganic";
-          float conf = params["confidence"] | 0.95;
-          broadcastDetectionEvent(mat, conf, "OPENING");
-          
-        } else if (commandType == "CLOSE") {
-          Serial.println("\n>>> Command Received: CLOSE INORGANIC");
-          selectedBin = BIN_NON_ORGANIC_ID;
-          currentState = CLOSING_BIN;
-        }
-      }
-    }
-  }
-  http.end();
 }  
 // WiFi.mode(WIFI_AP_STA);  // Both AP and STA for ESP-NOW
 //     WiFi.softAP("SmartBin_AP", "12345678");

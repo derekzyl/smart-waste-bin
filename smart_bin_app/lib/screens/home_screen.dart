@@ -419,8 +419,11 @@ class _DetectionStatusBanner extends StatelessWidget {
       case DetectionStatus.opening:
         final mat = provider.lastDetectionMaterial;
         final pct = (provider.lastDetectionConfidence * 100).round();
-        label = mat.isNotEmpty
-            ? '${mat == 'ORGANIC' ? 'Organic' : 'Non-organic'} ($pct%) — Opening bin'
+        final materialLabel = mat == 'ORGANIC'
+            ? 'Organic'
+            : (mat == 'NON_ORGANIC' || mat == 'INORGANIC' ? 'Non-organic' : mat.isEmpty ? '' : mat);
+        label = materialLabel.isNotEmpty
+            ? '$materialLabel ($pct%) — Opening bin'
             : 'Opening bin';
         icon = Icons.open_in_new;
         color = Colors.green;
