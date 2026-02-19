@@ -190,7 +190,7 @@ class BinProvider with ChangeNotifier {
       }
     }
     poll();
-    _simulationDetectionPollTimer = Timer.periodic(const Duration(seconds: 3), (_) => poll());
+    _simulationDetectionPollTimer = Timer.periodic(const Duration(seconds: 8), (_) => poll());
   }
 
   void stopSimulationDetectionPoll() {

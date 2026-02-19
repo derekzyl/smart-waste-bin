@@ -599,6 +599,7 @@ void loop() {
 
       if (selectedBin == BIN_ORGANIC_ID) {
         if (allowOpen) {
+          Serial.println(">>> Executing OPEN: organic bin (servo)");
           openBin(0);
           currentState = BIN_OPEN;
           binOpenTime = millis();
@@ -609,6 +610,7 @@ void loop() {
         }
       } else if (selectedBin == BIN_NON_ORGANIC_ID) {
         if (allowOpen) {
+          Serial.println(">>> Executing OPEN: inorganic bin (servo)");
           openBin(1);
           currentState = BIN_OPEN;
           binOpenTime = millis();
@@ -881,46 +883,64 @@ void pollBackendCommands() {
   String payload = http.getString();
   http.end();
 
+  if (payload.length() < 5) return;  // "[]" or "{}" only = no commands
+
   DynamicJsonDocument doc(2048);
   DeserializationError error = deserializeJson(doc, payload);
   if (error) {
-    Serial.printf("  ⚠️ JSON parse error: %s\n", error.c_str());
+    Serial.printf("  ⚠️ JSON parse error: %s (len=%d)\n", error.c_str(), payload.length());
     return;
   }
 
   JsonArray commands = doc["commands"];
-  for (JsonObject cmd : commands) {
-    String binId = cmd["bin_id"].as<String>();
-    String commandType = cmd["command"].as<String>();
-    JsonObject params = cmd["params"];
+  if (!commands || commands.size() == 0) return;
 
-    if (commandType == "OPEN") {
-      if (binId == BIN_ORGANIC_ID) {
-        Serial.println("\n>>> Command Received: OPEN ORGANIC (backend)");
-        selectedBin = BIN_ORGANIC_ID;
-      } else if (binId == BIN_NON_ORGANIC_ID) {
-        Serial.println("\n>>> Command Received: OPEN INORGANIC (backend)");
-        selectedBin = BIN_NON_ORGANIC_ID;
-      } else
-        continue;
-      currentState = OPENING_BIN;
-      openFromBackendCommand = true;
-      String mat = params["material"].as<String>();
-      if (mat.length() == 0) mat = (selectedBin == BIN_ORGANIC_ID) ? "Organic" : "Inorganic";
-      float conf = params["confidence"].as<float>();
-      if (conf <= 0.0f) conf = 0.95f;
-      broadcastDetectionEvent(mat, conf, "OPENING");
-    } else if (commandType == "CLOSE") {
-      if (binId == BIN_ORGANIC_ID) {
-        Serial.println("\n>>> Command Received: CLOSE ORGANIC");
-        selectedBin = BIN_ORGANIC_ID;
-      } else if (binId == BIN_NON_ORGANIC_ID) {
-        Serial.println("\n>>> Command Received: CLOSE INORGANIC");
-        selectedBin = BIN_NON_ORGANIC_ID;
-      } else
-        continue;
-      currentState = CLOSING_BIN;
+  JsonObject cmd = commands[0];
+  if (cmd.isNull()) return;
+
+  int cmdId = cmd["id"].as<int>();
+  String binId = cmd["bin_id"].as<String>();
+  binId.trim();
+  String commandType = cmd["command"].as<String>();
+  commandType.trim();
+
+  // Normalize bin_id
+  if (binId != BIN_ORGANIC_ID && binId != BIN_NON_ORGANIC_ID) {
+    if (binId == "0x001" || binId == "001") {
+      binId = BIN_ORGANIC_ID;
+    } else if (binId == "0x002" || binId == "002") {
+      binId = BIN_NON_ORGANIC_ID;
+    } else {
+      return;
     }
+  }
+
+  if (commandType == "OPEN") {
+    selectedBin = binId;
+    currentState = OPENING_BIN;
+    openFromBackendCommand = true;
+    JsonObject params = cmd["params"];
+    String mat = params["material"].as<String>();
+    mat.trim();
+    if (mat.length() == 0) mat = (binId == BIN_ORGANIC_ID) ? "Organic" : "Inorganic";
+    float conf = params["confidence"].as<float>();
+    if (conf <= 0.0f) conf = 0.95f;
+    broadcastDetectionEvent(mat, conf, "OPENING");
+  } else if (commandType == "CLOSE") {
+    selectedBin = binId;
+    currentState = CLOSING_BIN;
+  } else {
+    return;
+  }
+
+  // Ack so backend removes this command (re-delivered until ack'd)
+  if (cmdId > 0) {
+    String ackUrl = String(backend_url) + "/api/bins/commands/ack";
+    http.begin(client, ackUrl);
+    http.addHeader("Content-Type", "application/json");
+    String ackBody = "{\"ids\":[" + String(cmdId) + "]}";
+    http.POST(ackBody);
+    http.end();
   }
 }  
 // WiFi.mode(WIFI_AP_STA);  // Both AP and STA for ESP-NOW

@@ -186,6 +186,24 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                     ],
                   ),
                 ),
+                // Show mode so user knows why live updates work or not
+                Consumer<BinProvider>(
+                  builder: (context, p, _) {
+                    final isLive = p.esp32Ip != null && p.esp32Ip!.isNotEmpty;
+                    return Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Text(
+                        isLive
+                            ? 'Connected to device'
+                            : 'Backend only — set device IP in Settings for live bin',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(isLive ? 0.95 : 0.75),
+                          fontSize: 11,
+                        ),
+                      ),
+                    );
+                  },
+                ),
               ],
             ),
           ),
